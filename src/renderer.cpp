@@ -10,6 +10,7 @@
 #include <util_raytracing/camera.hpp>
 #include <util_raytracing/mesh.hpp>
 #include <util_raytracing/light.hpp>
+#include <util_raytracing/shader.hpp>
 #include <util_raytracing/model_cache.hpp>
 #include <luxcore/luxcore.h>
 #include <luxrays/core/geometry/matrix4x4.h>
@@ -19,6 +20,374 @@
 
 using namespace unirender::luxcorerender;
 #pragma optimize("",off)
+
+struct LuxNodeCache
+{
+	LuxNodeCache(uint32_t numNodes)
+	{
+		nodeNames.resize(numNodes);
+		convertedNodes.resize(numNodes);
+		propertyCache.resize(numNodes);
+	}
+	const std::string &GetNodeName(const unirender::NodeDesc &node) const {return nodeNames[node.GetIndex()];}
+	bool WasNodeConverted(const unirender::NodeDesc &node) const {return convertedNodes[node.GetIndex()];}
+	void SetNodeName(uint32_t idx,const std::string &name) {nodeNames[idx] = name;}
+	void AddToCache(const unirender::NodeDesc &node,const std::optional<luxrays::Properties> &props)
+	{
+		auto idx = node.GetIndex();
+		convertedNodes[idx] = true;
+		propertyCache[idx] = props;
+	}
+	std::optional<luxrays::Properties> *GetCachedProperties(const unirender::NodeDesc &node)
+	{
+		auto idx = node.GetIndex();
+		return convertedNodes[idx] ? &propertyCache[idx] : nullptr;
+	}
+	std::vector<std::string> nodeNames;
+	std::vector<bool> convertedNodes;
+	std::vector<std::optional<luxrays::Properties>> propertyCache;
+};
+
+class LuxNodeManager
+{
+public:
+	using NodeFactory = std::function<std::optional<luxrays::Properties>(luxcore::Scene&,unirender::GroupNodeDesc&,unirender::NodeDesc&,LuxNodeCache&)>;
+	static std::optional<luxrays::Property> socket_to_property(LuxNodeCache &nodeCache,const unirender::Socket &socket,const std::string &propName);
+	static std::optional<luxrays::Property> socket_to_property(LuxNodeCache &nodeCache,unirender::NodeDesc &node,const std::string &socketName,const std::string &propName);
+	static unirender::Socket *find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,const unirender::Socket &outputSocket);
+	static unirender::Socket *find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const std::string &inputSocketName);
+	NodeFactory *GetFactory(const std::string &nodeName)
+	{
+		auto it = m_factories.find(nodeName);
+		return (it != m_factories.end()) ? &it->second : nullptr;
+	}
+	std::optional<luxrays::Properties> ConvertNode(luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache);
+	void RegisterFactory(const std::string &nodeName,const NodeFactory &factory) {m_factories[nodeName] = factory;}
+	void Initialize();
+private:
+	bool ConvertSocketLinkedToInputToProperty(luxrays::Properties &props,luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,const std::string &inputSocketName,const std::string &propName);
+	std::unordered_map<std::string,NodeFactory> m_factories {};
+	bool m_initialized = false;
+};
+
+static LuxNodeManager g_luxNodeManager {};
+static LuxNodeManager &get_lux_node_manager()
+{
+	g_luxNodeManager.Initialize();
+	return g_luxNodeManager;
+}
+
+unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,const unirender::Socket &outputSocket)
+{
+	auto &links = rootNode.GetLinks();
+	auto it = std::find_if(links.begin(),links.end(),[&outputSocket](const unirender::NodeDescLink &link) {
+		return link.toSocket == outputSocket;
+	});
+	if(it == links.end() || it->fromSocket.IsValid() == false)
+		return nullptr;
+	return const_cast<unirender::Socket*>(&it->fromSocket);
+}
+
+unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const std::string &inputSocketName)
+{
+	auto sock = node.GetInputSocket(inputSocketName);
+	return find_socket_linked_to_input(rootNode,sock);
+}
+
+bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(luxrays::Properties &props,luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,const std::string &inputSocketName,const std::string &propName)
+{
+	auto *fromSocket = find_socket_linked_to_input(rootNode,node,inputSocketName);
+	if(fromSocket == nullptr)
+		return false;
+	if(fromSocket->IsNodeSocket())
+	{
+		auto *node = fromSocket->GetNode();
+		if(node)
+		{
+			if(node->IsGroupNode())
+			{
+				auto *groupNode = static_cast<unirender::GroupNodeDesc*>(node);
+				// TODO: Redirect
+			}
+			else
+				ConvertNode(scene,rootNode,*node,nodeCache);
+		}
+	}
+	auto prop = socket_to_property(nodeCache,*fromSocket,propName);
+	if(prop.has_value() == false)
+		return false;
+	props<<*prop;
+	return true;
+}
+
+static luxrays::Matrix4x4 to_luxcore_matrix(const Mat4 &transform)
+{
+	return {
+		transform[0][0],transform[0][1],transform[0][2],transform[0][3],
+		transform[1][0],transform[1][1],transform[1][2],transform[1][3],
+		transform[2][0],transform[2][1],transform[2][2],transform[2][3],
+		transform[3][0],transform[3][1],transform[3][2],transform[3][3]
+	};
+}
+
+std::optional<luxrays::Property> LuxNodeManager::socket_to_property(LuxNodeCache &nodeCache,const unirender::Socket &socket,const std::string &propName)
+{
+	luxrays::Property prop {propName};
+	if(socket.IsConcreteValue())
+	{
+		auto val = socket.GetValue();
+		if(val.has_value())
+		{
+			switch(val->type)
+			{
+			case unirender::SocketType::Bool:
+				prop(*val->ToValue<unirender::STBool>());
+				break;
+			case unirender::SocketType::Float:
+				prop(*val->ToValue<unirender::STFloat>());
+				break;
+			case unirender::SocketType::Int:
+				prop(*val->ToValue<unirender::STInt>());
+				break;
+			case unirender::SocketType::UInt:
+				prop(*val->ToValue<unirender::STUInt>());
+				break;
+			case unirender::SocketType::Color:
+			case unirender::SocketType::Vector:
+			case unirender::SocketType::Point:
+			case unirender::SocketType::Normal:
+			{
+				static_assert(std::is_same_v<unirender::STColor,unirender::STVector>);
+				static_assert(std::is_same_v<unirender::STColor,unirender::STPoint>);
+				static_assert(std::is_same_v<unirender::STColor,unirender::STNormal>);
+				auto &col = *val->ToValue<unirender::STColor>();
+				prop(col.x,col.y,col.z);
+				break;
+			}
+			case unirender::SocketType::Point2:
+			{
+				auto &col = *val->ToValue<unirender::STPoint2>();
+				prop(col.x,col.y);
+				break;
+			}
+			case unirender::SocketType::Closure:
+				return {}; // Unsupported
+			case unirender::SocketType::String:
+				prop(*val->ToValue<unirender::STString>());
+				break;
+			case unirender::SocketType::Enum:
+				prop(*val->ToValue<unirender::STEnum>());
+				break;
+			case unirender::SocketType::Transform:
+			{
+				//Mat4 m = *val->ToValue<unirender::STTransform>();
+				//auto lcm = to_luxcore_matrix(m);
+				//prop(lcm);
+				//break;
+				return {}; // Unsupported
+			}
+			case unirender::SocketType::Node:
+				return {}; // Unsupported
+			case unirender::SocketType::FloatArray:
+			{
+				auto &floatArray = *val->ToValue<unirender::STFloatArray>();
+				prop(floatArray);
+				break;
+			}
+			case unirender::SocketType::ColorArray:
+			{
+				auto &colorArray = *val->ToValue<unirender::STColorArray>();
+				std::vector<float> lxArray;
+				lxArray.resize(colorArray.size() *sizeof(colorArray.front()) /sizeof(float));
+				memcpy(lxArray.data(),colorArray.data(),colorArray.size() *sizeof(colorArray.front()));
+				prop(lxArray);
+				break;
+			}
+			}
+			static_assert(umath::to_integral(unirender::SocketType::Count) == 16);
+		}
+		return prop;
+	}
+	auto *socketNode = socket.GetNode();
+	if(socketNode == nullptr)
+		return prop;
+	prop("scene.textures." +nodeCache.GetNodeName(*socketNode));
+	return prop;
+}
+
+std::optional<luxrays::Property> LuxNodeManager::socket_to_property(LuxNodeCache &nodeCache,unirender::NodeDesc &node,const std::string &socketName,const std::string &propName)
+{
+	auto socket = node.GetInputSocket(socketName);
+	if(socket.IsValid() == false)
+		return {};
+	return socket_to_property(nodeCache,socket,propName);
+}
+
+std::optional<luxrays::Properties> LuxNodeManager::ConvertNode(luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache)
+{
+	auto *props = nodeCache.GetCachedProperties(node);
+	if(props)
+		return *props;
+	auto typeName = node.GetTypeName();
+	auto *factory = GetFactory(typeName);
+	if(factory == nullptr)
+	{
+		nodeCache.AddToCache(node,{});
+		return {};
+	}
+	auto newProps = (*factory)(scene,rootNode,node,nodeCache);
+	nodeCache.AddToCache(node,newProps);
+	if(newProps.has_value())
+		scene.Parse(*newProps);
+	return newProps;
+}
+
+void LuxNodeManager::Initialize()
+{
+	if(m_initialized)
+		return;
+	m_initialized = true;
+
+	RegisterFactory(unirender::NODE_MATH,[](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		auto type = node.GetPropertyValue<unirender::STEnum>(unirender::nodes::math::IN_TYPE);
+		if(type.has_value() == false)
+			return {};
+		std::string opName;
+		switch(static_cast<unirender::nodes::math::MathType>(*type))
+		{
+		case unirender::nodes::math::MathType::Add:
+			opName = "add";
+			break;
+		case unirender::nodes::math::MathType::Subtract:
+			opName = "subtract";
+			break;
+		case unirender::nodes::math::MathType::Multiply:
+			opName = "scale";
+			break;
+		case unirender::nodes::math::MathType::Divide:
+			// TODO: Custom
+			break;
+		case unirender::nodes::math::MathType::Sine:
+			break;
+		case unirender::nodes::math::MathType::Cosine:
+			break;
+		case unirender::nodes::math::MathType::Tangent:
+			break;
+		case unirender::nodes::math::MathType::ArcSine:
+			break;
+		case unirender::nodes::math::MathType::ArcCosine:
+			break;
+		case unirender::nodes::math::MathType::ArcTangent:
+			break;
+		case unirender::nodes::math::MathType::Power:
+			break;
+		case unirender::nodes::math::MathType::Logarithm:
+			break;
+		case unirender::nodes::math::MathType::Minimum:
+			break;
+		case unirender::nodes::math::MathType::Maximum:
+			break;
+		case unirender::nodes::math::MathType::Round:
+			break;
+		case unirender::nodes::math::MathType::LessThan:
+			break;
+		case unirender::nodes::math::MathType::GreaterThan:
+			break;
+		case unirender::nodes::math::MathType::Modulo:
+			break;
+		case unirender::nodes::math::MathType::Absolute:
+			break;
+		case unirender::nodes::math::MathType::ArcTan2:
+			break;
+		case unirender::nodes::math::MathType::Floor:
+			break;
+		case unirender::nodes::math::MathType::Ceil:
+			break;
+		case unirender::nodes::math::MathType::Fraction:
+			break;
+		case unirender::nodes::math::MathType::Sqrt:
+			break;
+		case unirender::nodes::math::MathType::InvSqrt:
+			break;
+		case unirender::nodes::math::MathType::Sign:
+			break;
+		case unirender::nodes::math::MathType::Exponent:
+			break;
+		case unirender::nodes::math::MathType::Radians:
+			break;
+		case unirender::nodes::math::MathType::Degrees:
+			break;
+		case unirender::nodes::math::MathType::SinH:
+			break;
+		case unirender::nodes::math::MathType::CosH:
+			break;
+		case unirender::nodes::math::MathType::TanH:
+			break;
+		case unirender::nodes::math::MathType::Trunc:
+			break;
+		case unirender::nodes::math::MathType::Snap:
+			break;
+		case unirender::nodes::math::MathType::Wrap:
+			break;
+		case unirender::nodes::math::MathType::Compare:
+			break;
+		case unirender::nodes::math::MathType::MultiplyAdd:
+			break;
+		case unirender::nodes::math::MathType::PingPong:
+			break;
+		case unirender::nodes::math::MathType::SmoothMin:
+			break;
+		case unirender::nodes::math::MathType::SmoothMax:
+			break;
+		}
+		if(opName.empty())
+			return {};
+		auto nodeName = nodeCache.GetNodeName(node);
+		std::string propName = "scene.textures." +nodeName;
+		luxrays::Properties props {};
+		props<<luxrays::Property{propName +".type"}(opName);
+		
+		auto propTex1 = socket_to_property(nodeCache,node,"value1",propName +"texture1");
+		if(propTex1.has_value())
+			props<<*propTex1;
+
+		auto propTex2 = socket_to_property(nodeCache,node,"value2",propName +"texture2");
+		if(propTex2.has_value())
+			props<<*propTex2;
+
+		// TODO: value3?
+		return props;
+	});
+	RegisterFactory(unirender::NODE_OUTPUT,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		auto *fromSocket = find_socket_linked_to_input(rootNode,node,unirender::nodes::output::IN_SURFACE);
+		if(fromSocket == nullptr)
+			return {};
+		if(fromSocket->IsConcreteValue())
+		{
+			// TODO: Emission shader
+
+		}
+		else
+		{
+			auto *inputNode = fromSocket->GetNode();
+			if(inputNode == nullptr)
+				return {};
+			auto props = ConvertNode(scene,rootNode,*inputNode,nodeCache);
+			// TODO: This is our actual output node
+		}
+		luxrays::Properties props {};
+		return props;
+	});
+	RegisterFactory(unirender::NODE_PRINCIPLED_BSDF,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		std::string propName = "scene.materials." +nodeCache.GetNodeName(node);
+		props<<luxrays::Property(propName +".type")("disney");
+		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_BASE_COLOR,propName +".basecolor");
+		return props;
+	});
+}
+
+////////////
 
 extern "C" {
 	std::shared_ptr<unirender::Renderer> __declspec(dllexport) test_luxcorerender(const unirender::Scene &scene)
@@ -276,16 +645,7 @@ void Renderer::SyncFilm(const unirender::Camera &cam)
 	);
 }
 
-static luxrays::Matrix4x4 to_luxcore_matrix(const umath::ScaledTransform &t)
-{
-	auto transform = t.ToMatrix();
-	return {
-		transform[0][0],transform[0][1],transform[0][2],transform[0][3],
-		transform[1][0],transform[1][1],transform[1][2],transform[1][3],
-		transform[2][0],transform[2][1],transform[2][2],transform[2][3],
-		transform[3][0],transform[3][1],transform[3][2],transform[3][3]
-	};
-}
+static luxrays::Matrix4x4 to_luxcore_matrix(const umath::ScaledTransform &t) {return to_luxcore_matrix(t.ToMatrix());}
 
 void Renderer::SyncObject(const unirender::Object &obj)
 {
@@ -373,6 +733,20 @@ static Vector3 calc_hair_normal(const Vector3 &flowNormal,const Vector3 &faceNor
 	return hairNormal;
 }
 
+class LuxShaderNode
+{
+public:
+	uint32_t nodeIndex = 0u;
+private:
+};
+
+class LuxShader
+{
+public:
+private:
+	uint32_t m_curNode = 0;
+};
+
 void Renderer::SyncMesh(const unirender::Mesh &mesh)
 {
 	auto &verts = mesh.GetVertices();
@@ -417,6 +791,60 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 	auto name = GetName(mesh);
 	m_lxScene->DefineMesh(name,verts.size(),numTris,reinterpret_cast<float*>(points),reinterpret_cast<unsigned int*>(lxTris),reinterpret_cast<float*>(lxNormals),reinterpret_cast<float*>(lxUvs),nullptr,nullptr);
 
+	// Shaders
+	auto &luxNodeManager = get_lux_node_manager();
+	auto &shaders = mesh.GetSubMeshShaders();
+	for(auto i=decltype(shaders.size()){0u};i<shaders.size();++i)
+	{
+		auto desc = shaders.at(i)->GetActivePassNode();
+		if(desc == nullptr)
+			desc = GroupNodeDesc::Create(m_scene->GetShaderNodeManager()); // Just create a dummy node
+		auto &nodes = desc->GetChildNodes();
+
+		LuxNodeCache nodeCache {static_cast<uint32_t>(nodes.size())};
+		for(auto i=decltype(nodes.size()){0u};i<nodes.size();++i)
+		{
+			auto &node = nodes[i];
+			auto name = "node_" +node->GetName() +std::to_string(node->GetIndex());
+			nodeCache.SetNodeName(i,name);
+		}
+		for(auto &node : nodes)
+		{
+			if(node->GetOutputs().empty() == false)
+				continue;
+			auto &type = node->GetTypeName();
+			auto *factory = luxNodeManager.GetFactory(type);
+			if(factory)
+			{
+				auto properties = (*factory)(*m_lxScene,*desc,*node,nodeCache);
+				if(properties.has_value())
+					m_lxScene->Parse(*properties);
+			}
+			else
+				std::cout<<"WARNING: Unsupported node type '"<<node->GetTypeName()<<"'!"<<std::endl;
+		}
+		/*for(auto &node : nodes)
+		{
+			auto &type = node->GetTypeName();
+			auto *factory = luxNodeManager.GetFactory(type);
+			if(factory)
+			{
+				auto properties = (*factory)(*node,nodeNames);
+				if(properties.has_value())
+					m_lxScene->Parse(*properties);
+			}
+			else
+				std::cout<<"WARNING: Unsupported node type '"<<node->GetTypeName()<<"'!"<<std::endl;
+		}*/
+		std::cout<<desc.get()<<std::endl;
+		/*auto cclShader = CCLShader::Create(*this,*desc);
+		if(cclShader == nullptr)
+			throw std::logic_error{"Mesh shader must never be NULL!"};
+		if(cclShader)
+			cclMesh->used_shaders[i] = **cclShader;*/
+	}
+
+	// Hair
 	std::vector<double> triAreas;
 	triAreas.reserve(numTris);
 	double totalArea = 0.0;
@@ -454,6 +882,7 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 	// TODO: Implement random brownian force
 	// TODO: Implement curvature
 	// TODO: Implement clumping
+	// TODO: Prevent strand collisions / duplicates (minimum distance between strands?)
 	
 	luxrays::cyHairFile hairFile {};
 	hairFile.Initialize();
