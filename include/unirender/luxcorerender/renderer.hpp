@@ -33,7 +33,16 @@ namespace unirender::luxcorerender
 		virtual util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> StartRender() override;
 	private:
 		Renderer(const Scene &scene);
+		void StopRenderSession();
 		static std::string GetName(const BaseObject &obj);
+		static std::string GetName(const Object &obj,uint32_t shaderIdx);
+		static std::string GetName(const Mesh &mesh,uint32_t shaderIdx);
+
+		virtual util::EventReply HandleRenderStage(RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye eyeStage,unirender::Renderer::RenderStageResult *optResult=nullptr) override;
+		virtual bool UpdateStereoEye(unirender::RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye &eyeStage) override;
+		virtual void CloseRenderScene() override;
+		virtual void FinalizeImage(uimg::ImageBuffer &imgBuf);
+		
 		bool Initialize();
 		void SyncCamera(const unirender::Camera &cam);
 		void SyncFilm(const unirender::Camera &cam);
@@ -43,6 +52,7 @@ namespace unirender::luxcorerender
 		virtual void SetCancelled(const std::string &msg="Cancelled by application.") override;
 		virtual void PrepareCyclesSceneForRendering() override;
 
+		uint32_t m_shaderNodeIdx = 0;
 		std::unique_ptr<luxcore::Scene> m_lxScene = nullptr;
 		std::unique_ptr<luxcore::RenderConfig> m_lxConfig = nullptr;
 		std::unique_ptr<luxcore::RenderSession> m_lxSession = nullptr;
