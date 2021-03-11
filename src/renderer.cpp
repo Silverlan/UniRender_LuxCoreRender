@@ -2,7 +2,7 @@
 * License, v. 2.0. If a copy of the MPL was not distributed with this
 * file, You can obtain one at http://mozilla.org/MPL/2.0/.
 *
-* Copyright (c) 2020 Florian Weischer
+* Copyright (c) 2021 Silverlan
 */
 
 #include "unirender/luxcorerender/renderer.hpp"
@@ -12,14 +12,24 @@
 #include <util_raytracing/light.hpp>
 #include <util_raytracing/shader.hpp>
 #include <util_raytracing/model_cache.hpp>
+#include <util_raytracing/color_management.hpp>
+#include <util_raytracing/denoise.hpp>
 #include <util_ocio.hpp>
 #include <mathutil/umath_lighting.hpp>
+#include <sharedutils/util_string.h>
 #include <luxcore/luxcore.h>
 #include <luxrays/core/geometry/matrix4x4.h>
 #include <luxrays/core/geometry/point.h>
 #include <luxrays/core/geometry/triangle.h>
 #include <luxrays/core/geometry/uv.h>
 #include <util_image_buffer.hpp>
+#include <util_image.hpp>
+#include <util_texture_info.hpp>
+#include <sharedutils/util_path.hpp>
+#include <sharedutils/scope_guard.h>
+#include <fsys/filesystem.h>
+#define TINYEXR_IMPLEMENTATION
+#include "tinyexr.h"
 
 using namespace unirender::luxcorerender;
 #pragma optimize("",off)
@@ -91,52 +101,87 @@ static std::unique_ptr<luxrays::cyHairFile> generate_hair_file(const unirender::
 
 struct LuxNodeCache
 {
-	LuxNodeCache(uint32_t numNodes)
+	LuxNodeCache(uint32_t numNodes,uint32_t &shaderNodeIdx)
+		: m_shaderNodeIdx{shaderNodeIdx}
 	{
-		nodeNames.resize(numNodes);
-		convertedNodes.resize(numNodes);
-		propertyCache.resize(numNodes);
+		nodeNames.reserve(numNodes);
+		convertedNodes.reserve(numNodes);
+		propertyCache.reserve(numNodes);
 	}
-	const std::string &GetNodeName(const unirender::NodeDesc &node) const {return nodeNames[node.GetIndex()];}
-	bool WasNodeConverted(const unirender::NodeDesc &node) const {return convertedNodes[node.GetIndex()];}
-	void SetNodeName(uint32_t idx,const std::string &name) {nodeNames[idx] = name;}
-	void AddToCache(const unirender::NodeDesc &node,const std::optional<luxrays::Properties> &props)
+	const std::string &GetNodeName(const unirender::NodeDesc &node) const
 	{
-		auto idx = node.GetIndex();
-		convertedNodes[idx] = true;
-		propertyCache[idx] = props;
+		auto it = nodeNames.find(&node);
+		if(it == nodeNames.end())
+		{
+			auto name = "node_" +node.GetName() +std::to_string(m_shaderNodeIdx++);
+			it = nodeNames.insert(std::make_pair(&node,name)).first;
+		}
+		return it->second;		
 	}
-	std::optional<luxrays::Properties> *GetCachedProperties(const unirender::NodeDesc &node)
+	bool WasLinkConverted(const unirender::Socket &inputSocket) const {return convertedNodes.find(inputSocket) != convertedNodes.end();}
+	const std::string &GetLinkedSocketName(const unirender::Socket &inputSocket) const
 	{
-		auto idx = node.GetIndex();
-		return convertedNodes[idx] ? &propertyCache[idx] : nullptr;
+		auto it = convertedNodes.find(inputSocket);
+		if(it != convertedNodes.end())
+			return propertyCache[it->second].propName;
+		static std::string empty_string {};
+		return empty_string;
 	}
-	std::vector<std::string> nodeNames;
-	std::vector<bool> convertedNodes;
-	std::vector<std::optional<luxrays::Properties>> propertyCache;
+	std::string ToLinkedSocketName(const unirender::Socket &inputSocket) const
+	{
+		std::string socketName;
+		auto *node = inputSocket.GetNode(socketName);
+		assert(node);
+		return GetNodeName(*node) +'_' +socketName;
+	}
+	void AddToCache(const unirender::Socket &inputSocket,const std::optional<luxrays::Properties> &props,const std::string &propName)
+	{
+		if(WasLinkConverted(inputSocket))
+			return;
+		auto idx = propertyCache.size();
+		convertedNodes.insert(std::make_pair(inputSocket,idx));
+		if(propertyCache.size() == propertyCache.capacity())
+			propertyCache.reserve(propertyCache.size() *1.1f +100);
+		propertyCache.push_back(PropertyCache{props,propName});
+	}
+	std::optional<luxrays::Properties> *GetCachedProperties(const unirender::Socket &inputSocket)
+	{
+		auto it = convertedNodes.find(inputSocket);
+		return (it != convertedNodes.end()) ? &propertyCache[it->second].props : nullptr;
+	}
+	struct PropertyCache
+	{
+		std::optional<luxrays::Properties> props {};
+		std::string propName;
+	};
+	mutable std::unordered_map<const unirender::NodeDesc*,std::string> nodeNames;
+	std::unordered_map<unirender::Socket,size_t> convertedNodes;
+	std::vector<PropertyCache> propertyCache;
+private:
+	uint32_t &m_shaderNodeIdx;
 };
 
 class LuxNodeManager
 {
 public:
-	using NodeFactory = std::function<std::optional<luxrays::Properties>(luxcore::Scene&,unirender::GroupNodeDesc&,unirender::NodeDesc&,LuxNodeCache&)>;
+	using NodeFactory = std::function<std::optional<luxrays::Properties>(unirender::luxcorerender::Renderer&,unirender::GroupNodeDesc&,unirender::NodeDesc&,const unirender::Socket&,LuxNodeCache&)>;
 	static std::optional<luxrays::Property> datavalue_to_property(LuxNodeCache &nodeCache,const unirender::DataValue &dataValue,const std::string &propName);
 	static std::optional<luxrays::Property> socket_to_property(LuxNodeCache &nodeCache,const unirender::Socket &socket,const std::string &propName,bool includeTexturePrefix=true);
 	static std::optional<luxrays::Property> socket_to_property(LuxNodeCache &nodeCache,unirender::NodeDesc &node,const std::string &socketName,const std::string &propName);
 	static unirender::Socket *find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,const unirender::Socket &outputSocket);
-	static unirender::Socket *find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const std::string &inputSocketName);
+	static unirender::Socket *find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const std::string &inputSocketName,bool output=false);
 	NodeFactory *GetFactory(const std::string &nodeName)
 	{
 		auto it = m_factories.find(nodeName);
 		return (it != m_factories.end()) ? &it->second : nullptr;
 	}
-	std::optional<luxrays::Properties> ConvertNode(luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache);
+	std::optional<luxrays::Properties> ConvertLinkedNode(unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,const unirender::Socket &inputSocket,LuxNodeCache &nodeCache);
 	void RegisterFactory(const std::string &nodeName,const NodeFactory &factory) {m_factories[nodeName] = factory;}
 	void Initialize();
 private:
 	bool ConvertSocketLinkedToInputToProperty(
-		luxrays::Properties &props,luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,
-		const std::string &inputSocketName,const std::string &propName,bool includeTexturePrefix=true
+		luxrays::Properties &props,unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,
+		const std::string &inputSocketName,const std::string &propName,bool includeTexturePrefix=true,bool output=false,bool ignoreConcreteValueIfNoInputLinked=false
 	);
 	std::unordered_map<std::string,NodeFactory> m_factories {};
 	bool m_initialized = false;
@@ -160,18 +205,18 @@ unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupN
 	return const_cast<unirender::Socket*>(&it->fromSocket);
 }
 
-unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const std::string &inputSocketName)
+unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const std::string &inputSocketName,bool output)
 {
-	auto sock = node.GetInputOrProperty(inputSocketName);
+	auto sock = output ? node.GetOutputSocket(inputSocketName) : node.GetInputOrProperty(inputSocketName);
 	return find_socket_linked_to_input(rootNode,sock);
 }
 
 bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(
-	luxrays::Properties &props,luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,
-	const std::string &inputSocketName,const std::string &propName,bool includeTexturePrefix
+	luxrays::Properties &props,unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,
+	const std::string &inputSocketName,const std::string &propName,bool includeTexturePrefix,bool output,bool ignoreConcreteValueIfNoInputLinked
 )
 {
-	auto *fromSocket = find_socket_linked_to_input(rootNode,node,inputSocketName);
+	auto *fromSocket = find_socket_linked_to_input(rootNode,node,inputSocketName,output);
 	auto socketToProperty = [&nodeCache,&propName](unirender::NodeDesc &node,const std::string &socketName,bool output=false) -> std::optional<luxrays::Property> {
 		auto *inputSocketDesc = output ? node.FindOutputSocketDesc(socketName) : node.FindInputOrPropertyDesc(socketName);
 		if(inputSocketDesc == nullptr)
@@ -180,6 +225,8 @@ bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(
 	};
 	if(fromSocket == nullptr)
 	{
+		if(ignoreConcreteValueIfNoInputLinked)
+			return true;
 		auto prop = socketToProperty(node,inputSocketName);
 		if(prop.has_value() == false)
 			return false;
@@ -192,52 +239,12 @@ bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(
 		auto *node = fromSocket->GetNode(fromSocketName);
 		if(node)
 		{
+			assert(!node->IsGroupNode());
 			if(node->IsGroupNode())
-			{
-				auto *groupNode = static_cast<unirender::GroupNodeDesc*>(node);
-				auto &links = groupNode->GetLinks();
-				auto it = std::find_if(links.begin(),links.end(),[&fromSocket](const unirender::NodeDescLink &link) {
-					return link.toSocket == *fromSocket;
-				});
-				if(it == links.end())
-				{
-					auto &links = rootNode.GetLinks();
-					auto it = std::find_if(links.begin(),links.end(),[&fromSocket](const unirender::NodeDescLink &link) {
-						return link.toSocket == *fromSocket;
-					});
-					if(it == links.end())
-					{
-						auto prop = socketToProperty(*groupNode,fromSocketName,fromSocket->IsOutputSocket());
-						if(prop.has_value() == false)
-							return false;
-						props<<*prop;
-						return true;
-					}
-					else
-					{
-						auto &link = *it;
-						auto &groupFromSocket = link.fromSocket;
-						std::string fromSocketName;
-						auto *fromNode = groupFromSocket.GetNode(fromSocketName);
-						return fromNode ? ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,*fromNode,fromSocketName,propName,includeTexturePrefix) : false;
-					}
-				}
-				else
-				{
-					auto &link = *it;
-					auto &groupFromSocket = link.fromSocket;
-					auto *fromNode = groupFromSocket.GetNode();
-					if(fromNode)
-						ConvertNode(scene,*groupNode,*fromNode,nodeCache);
-					fromSocket = const_cast<unirender::Socket*>(&link.fromSocket);
-				}
-			}
-			else
-			{
-				auto prop = ConvertNode(scene,rootNode,*node,nodeCache);
-				if(prop.has_value() == false)
-					return false;
-			}
+				throw std::logic_error{"Found unresolved group node!"};
+			auto prop = ConvertLinkedNode(renderer,rootNode,*fromSocket,nodeCache);
+			if(prop.has_value() == false)
+				return false;
 		}
 	}
 	auto prop = socket_to_property(nodeCache,*fromSocket,propName,includeTexturePrefix);
@@ -247,18 +254,54 @@ bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(
 	return true;
 }
 
-static luxrays::Matrix4x4 to_luxcore_matrix(const Mat4 &transform)
+static luxrays::Property to_luxcore_matrix(const std::string &propName,const Mat4 &transform)
 {
-	return {
-		transform[0][0],transform[0][1],transform[0][2],transform[0][3],
-		transform[1][0],transform[1][1],transform[1][2],transform[1][3],
-		transform[2][0],transform[2][1],transform[2][2],transform[2][3],
-		transform[3][0],transform[3][1],transform[3][2],transform[3][3]
-	};
+	luxrays::Property prop {propName};
+	for(uint8_t i=0;i<4;++i)
+	{
+		for(uint8_t j=0;j<4;++j)
+			prop.Add<float>(transform[i][j]);
+	}
+	return prop;
+}
+static luxrays::Property to_luxcore_matrix(const std::string &propName,const luxrays::Matrix4x4 &m)
+{
+	luxrays::Property prop {propName};
+	for(uint8_t i=0;i<4;++i)
+	{
+		for(uint8_t j=0;j<4;++j)
+			prop.Add<float>(m.m[i][j]);
+	}
+	return prop;
+}
+static luxrays::Property to_luxcore_matrix(const std::string &propName,const umath::ScaledTransform &t)
+{
+	auto tlux = unirender::luxcorerender::Renderer::ToLuxTransform(t,true);
+	return to_luxcore_matrix(propName,tlux.ToMatrix());
+}
+static const luxrays::Vector &to_luxcore_vector(const luxrays::Normal &n)
+{
+	static_assert(sizeof(luxrays::Normal) == sizeof(luxrays::Vector));
+	return reinterpret_cast<const luxrays::Vector&>(n);
+}
+static const luxrays::Vector &to_luxcore_vector(const luxrays::Point &p)
+{
+	static_assert(sizeof(luxrays::Normal) == sizeof(luxrays::Vector));
+	return reinterpret_cast<const luxrays::Vector&>(p);
+}
+
+static luxrays::Property to_luxcore_list(const std::string &propName,const std::vector<std::string> &list)
+{
+	luxrays::Property prop {propName};
+	for(auto &item : list)
+		prop.Add<std::string>(item);
+	return prop;
 }
 
 std::optional<luxrays::Property> LuxNodeManager::datavalue_to_property(LuxNodeCache &nodeCache,const unirender::DataValue &dataValue,const std::string &propName)
 {
+	if(dataValue.value == nullptr)
+		return {};
 	luxrays::Property prop {propName};
 	switch(dataValue.type)
 	{
@@ -346,7 +389,7 @@ std::optional<luxrays::Property> LuxNodeManager::socket_to_property(LuxNodeCache
 	std::string texPropName;
 	if(includeTexturePrefix)
 		texPropName = "scene.textures.";
-	texPropName += nodeCache.GetNodeName(*socketNode);
+	texPropName += nodeCache.GetLinkedSocketName(socket);
 	prop(texPropName);
 	return prop;
 }
@@ -359,24 +402,124 @@ std::optional<luxrays::Property> LuxNodeManager::socket_to_property(LuxNodeCache
 	return socket_to_property(nodeCache,socket,propName);
 }
 
-std::optional<luxrays::Properties> LuxNodeManager::ConvertNode(luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache)
+std::optional<luxrays::Properties> LuxNodeManager::ConvertLinkedNode(unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,const unirender::Socket &inputSocket,LuxNodeCache &nodeCache)
 {
-	auto *props = nodeCache.GetCachedProperties(node);
+	auto *inputNode = inputSocket.GetNode();
+	if(inputNode == nullptr)
+		return {};
+	auto *props = nodeCache.GetCachedProperties(inputSocket);
 	if(props)
 		return *props;
-	auto typeName = node.GetTypeName();
+	auto typeName = inputNode->GetTypeName();
 	auto *factory = GetFactory(typeName);
 	if(factory == nullptr)
 	{
 		std::cout<<"WARNING: No shader node factory found for node type '"<<typeName<<"'!"<<std::endl;
-		nodeCache.AddToCache(node,{});
+		nodeCache.AddToCache(inputSocket,{},"");
 		return {};
 	}
-	auto newProps = (*factory)(scene,rootNode,node,nodeCache);
-	nodeCache.AddToCache(node,newProps);
+	auto newProps = (*factory)(renderer,rootNode,*inputNode,inputSocket,nodeCache);
+	nodeCache.AddToCache(inputSocket,newProps,nodeCache.ToLinkedSocketName(inputSocket));
 	if(newProps.has_value())
-		scene.Parse(*newProps);
+		renderer.GetLuxScene().Parse(*newProps);
 	return newProps;
+}
+
+static std::string math_type_to_luxcore_op(unirender::nodes::math::MathType mathType)
+{
+	std::string opName;
+	switch(mathType)
+	{
+	case unirender::nodes::math::MathType::Add:
+		opName = "add";
+		break;
+	case unirender::nodes::math::MathType::Subtract:
+		opName = "subtract";
+		break;
+	case unirender::nodes::math::MathType::Multiply:
+		opName = "scale";
+		break;
+	case unirender::nodes::math::MathType::Divide:
+		opName = "divide";
+		break;
+	case unirender::nodes::math::MathType::Sine:
+		break;
+	case unirender::nodes::math::MathType::Cosine:
+		break;
+	case unirender::nodes::math::MathType::Tangent:
+		break;
+	case unirender::nodes::math::MathType::ArcSine:
+		break;
+	case unirender::nodes::math::MathType::ArcCosine:
+		break;
+	case unirender::nodes::math::MathType::ArcTangent:
+		break;
+	case unirender::nodes::math::MathType::Power:
+		opName = "power";
+		break;
+	case unirender::nodes::math::MathType::Logarithm:
+		break;
+	case unirender::nodes::math::MathType::Minimum:
+		break;
+	case unirender::nodes::math::MathType::Maximum:
+		break;
+	case unirender::nodes::math::MathType::Round:
+		break;
+	case unirender::nodes::math::MathType::LessThan:
+		opName = "lessthan";
+		break;
+	case unirender::nodes::math::MathType::GreaterThan:
+		opName = "greaterthan";
+		break;
+	case unirender::nodes::math::MathType::Modulo:
+		break;
+	case unirender::nodes::math::MathType::Absolute:
+		opName = "abs";
+		break;
+	case unirender::nodes::math::MathType::ArcTan2:
+		break;
+	case unirender::nodes::math::MathType::Floor:
+		break;
+	case unirender::nodes::math::MathType::Ceil:
+		break;
+	case unirender::nodes::math::MathType::Fraction:
+		break;
+	case unirender::nodes::math::MathType::Sqrt:
+		break;
+	case unirender::nodes::math::MathType::InvSqrt:
+		break;
+	case unirender::nodes::math::MathType::Sign:
+		break;
+	case unirender::nodes::math::MathType::Exponent:
+		break;
+	case unirender::nodes::math::MathType::Radians:
+		break;
+	case unirender::nodes::math::MathType::Degrees:
+		break;
+	case unirender::nodes::math::MathType::SinH:
+		break;
+	case unirender::nodes::math::MathType::CosH:
+		break;
+	case unirender::nodes::math::MathType::TanH:
+		break;
+	case unirender::nodes::math::MathType::Trunc:
+		break;
+	case unirender::nodes::math::MathType::Snap:
+		break;
+	case unirender::nodes::math::MathType::Wrap:
+		break;
+	case unirender::nodes::math::MathType::Compare:
+		break;
+	case unirender::nodes::math::MathType::MultiplyAdd:
+		break;
+	case unirender::nodes::math::MathType::PingPong:
+		break;
+	case unirender::nodes::math::MathType::SmoothMin:
+		break;
+	case unirender::nodes::math::MathType::SmoothMax:
+		break;
+	}
+	return opName;
 }
 
 void LuxNodeManager::Initialize()
@@ -385,184 +528,48 @@ void LuxNodeManager::Initialize()
 		return;
 	m_initialized = true;
 
-	RegisterFactory(unirender::NODE_MATH,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+	RegisterFactory(unirender::NODE_MATH,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		auto type = node.GetPropertyValue<unirender::STEnum>(unirender::nodes::math::IN_TYPE);
 		if(type.has_value() == false)
 			return {};
-		std::string opName;
-		switch(static_cast<unirender::nodes::math::MathType>(*type))
-		{
-		case unirender::nodes::math::MathType::Add:
-			opName = "add";
-			break;
-		case unirender::nodes::math::MathType::Subtract:
-			opName = "subtract";
-			break;
-		case unirender::nodes::math::MathType::Multiply:
-			opName = "scale";
-			break;
-		case unirender::nodes::math::MathType::Divide:
-			// TODO: Custom
-			break;
-		case unirender::nodes::math::MathType::Sine:
-			break;
-		case unirender::nodes::math::MathType::Cosine:
-			break;
-		case unirender::nodes::math::MathType::Tangent:
-			break;
-		case unirender::nodes::math::MathType::ArcSine:
-			break;
-		case unirender::nodes::math::MathType::ArcCosine:
-			break;
-		case unirender::nodes::math::MathType::ArcTangent:
-			break;
-		case unirender::nodes::math::MathType::Power:
-			break;
-		case unirender::nodes::math::MathType::Logarithm:
-			break;
-		case unirender::nodes::math::MathType::Minimum:
-			break;
-		case unirender::nodes::math::MathType::Maximum:
-			break;
-		case unirender::nodes::math::MathType::Round:
-			break;
-		case unirender::nodes::math::MathType::LessThan:
-			break;
-		case unirender::nodes::math::MathType::GreaterThan:
-			break;
-		case unirender::nodes::math::MathType::Modulo:
-			break;
-		case unirender::nodes::math::MathType::Absolute:
-			break;
-		case unirender::nodes::math::MathType::ArcTan2:
-			break;
-		case unirender::nodes::math::MathType::Floor:
-			break;
-		case unirender::nodes::math::MathType::Ceil:
-			break;
-		case unirender::nodes::math::MathType::Fraction:
-			break;
-		case unirender::nodes::math::MathType::Sqrt:
-			break;
-		case unirender::nodes::math::MathType::InvSqrt:
-			break;
-		case unirender::nodes::math::MathType::Sign:
-			break;
-		case unirender::nodes::math::MathType::Exponent:
-			break;
-		case unirender::nodes::math::MathType::Radians:
-			break;
-		case unirender::nodes::math::MathType::Degrees:
-			break;
-		case unirender::nodes::math::MathType::SinH:
-			break;
-		case unirender::nodes::math::MathType::CosH:
-			break;
-		case unirender::nodes::math::MathType::TanH:
-			break;
-		case unirender::nodes::math::MathType::Trunc:
-			break;
-		case unirender::nodes::math::MathType::Snap:
-			break;
-		case unirender::nodes::math::MathType::Wrap:
-			break;
-		case unirender::nodes::math::MathType::Compare:
-			break;
-		case unirender::nodes::math::MathType::MultiplyAdd:
-			break;
-		case unirender::nodes::math::MathType::PingPong:
-			break;
-		case unirender::nodes::math::MathType::SmoothMin:
-			break;
-		case unirender::nodes::math::MathType::SmoothMax:
-			break;
-		}
+		auto opName = math_type_to_luxcore_op(static_cast<unirender::nodes::math::MathType>(*type));
 		if(opName.empty())
 		{
 			std::cout<<"WARNING: Math operation '"<<*type<<"' currently not supported for LuxCoreRender!"<<std::endl;
 			return {};
 		}
-		auto nodeName = nodeCache.GetNodeName(node);
-		std::string propName = "scene.textures." +nodeName;
+		auto nodeName = nodeCache.ToLinkedSocketName(outputSocket);
+		auto propName = "scene.textures." +nodeName;
 		luxrays::Properties props {};
 		props<<luxrays::Property{propName +".type"}(opName);
 		
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::math::IN_VALUE1,propName +".texture1",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::math::IN_VALUE2,propName +".texture2",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::math::IN_VALUE1,propName +".texture1",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::math::IN_VALUE2,propName +".texture2",false);
 
 		// TODO: value3?
 		return props;
 	});
-	RegisterFactory(unirender::NODE_VECTOR_MATH,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+	RegisterFactory(unirender::NODE_VECTOR_MATH,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		auto type = node.GetPropertyValue<unirender::STEnum>(unirender::nodes::vector_math::IN_TYPE);
 		if(type.has_value() == false)
 			return {};
-		std::string opName;
-		switch(static_cast<unirender::nodes::vector_math::MathType>(*type))
-		{
-		case unirender::nodes::vector_math::MathType::Add:
-			opName = "add";
-			break;
-		case unirender::nodes::vector_math::MathType::Subtract:
-			opName = "subtract";
-			break;
-		case unirender::nodes::vector_math::MathType::Multiply:
-			opName = "scale";
-			break;
-		case unirender::nodes::vector_math::MathType::Divide:
-			break;
-
-		case unirender::nodes::vector_math::MathType::CrossProduct:
-			break;
-		case unirender::nodes::vector_math::MathType::Project:
-			break;
-		case unirender::nodes::vector_math::MathType::Reflect:
-			break;
-		case unirender::nodes::vector_math::MathType::DotProduct:
-			break;
-
-		case unirender::nodes::vector_math::MathType::Distance:
-			break;
-		case unirender::nodes::vector_math::MathType::Length:
-			break;
-		case unirender::nodes::vector_math::MathType::Scale:
-			break;
-		case unirender::nodes::vector_math::MathType::Normalize:
-			break;
-
-		case unirender::nodes::vector_math::MathType::Snap:
-			break;
-		case unirender::nodes::vector_math::MathType::Floor:
-			break;
-		case unirender::nodes::vector_math::MathType::Ceil:
-			break;
-		case unirender::nodes::vector_math::MathType::Modulo:
-			break;
-		case unirender::nodes::vector_math::MathType::Fraction:
-			break;
-		case unirender::nodes::vector_math::MathType::Absolute:
-			break;
-		case unirender::nodes::vector_math::MathType::Minimum:
-			break;
-		case unirender::nodes::vector_math::MathType::Maximum:
-			break;
-		};
+		auto opName = math_type_to_luxcore_op(static_cast<unirender::nodes::math::MathType>(*type));
 		if(opName.empty())
 		{
 			std::cout<<"WARNING: Math operation '"<<*type<<"' currently not supported for LuxCoreRender!"<<std::endl;
 			return {};
 		}
-		auto nodeName = nodeCache.GetNodeName(node);
-		std::string propName = "scene.textures." +nodeName;
+		auto nodeName = nodeCache.ToLinkedSocketName(outputSocket);
+		auto propName = "scene.textures." +nodeName;
 		luxrays::Properties props {};
 		props<<luxrays::Property{propName +".type"}(opName);
 		
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::vector_math::IN_VECTOR1,propName +".texture1",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::vector_math::IN_VECTOR2,propName +".texture2",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::vector_math::IN_VECTOR1,propName +".texture1",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::vector_math::IN_VECTOR2,propName +".texture2",false);
 		// TODO: vector3?
 		return props;
 	});
-	RegisterFactory(unirender::NODE_OUTPUT,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+	RegisterFactory(unirender::NODE_OUTPUT,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		auto *fromSocket = find_socket_linked_to_input(rootNode,node,unirender::nodes::output::IN_SURFACE);
 		if(fromSocket == nullptr)
 			return {};
@@ -576,93 +583,222 @@ void LuxNodeManager::Initialize()
 			auto *inputNode = fromSocket->GetNode();
 			if(inputNode == nullptr)
 				return {};
-			return ConvertNode(scene,rootNode,*inputNode,nodeCache);
+			return ConvertLinkedNode(renderer,rootNode,*fromSocket,nodeCache);
 		}
 		luxrays::Properties props {};
 		return props;
 	});
-	RegisterFactory(unirender::NODE_PRINCIPLED_BSDF,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+	RegisterFactory(unirender::NODE_PRINCIPLED_BSDF,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		luxrays::Properties props {};
-		std::string propName = "scene.materials." +nodeCache.GetNodeName(node);
+		auto propName = "scene.materials." +nodeCache.ToLinkedSocketName(outputSocket);
 		props<<luxrays::Property(propName +".type")("disney");
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_BASE_COLOR,propName +".basecolor",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ROUGHNESS,propName +".roughness",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_METALLIC,propName +".metallic",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SUBSURFACE,propName +".subsurface",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SPECULAR,propName +".specular",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SPECULAR_TINT,propName +".speculartint",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_CLEARCOAT,propName +".clearcoat",false);
-		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_CLEARCOAT_ROUGHNESS,propName +".clearcoatgloss",false); // TODO
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ANISOTROPIC,propName +".anisotropic",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SHEEN,propName +".sheen",false);
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SHEEN_TINT,propName +".sheentint",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_BASE_COLOR,propName +".basecolor",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ROUGHNESS,propName +".roughness",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_METALLIC,propName +".metallic",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SUBSURFACE,propName +".subsurface",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SPECULAR,propName +".specular",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SPECULAR_TINT,propName +".speculartint",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_CLEARCOAT,propName +".clearcoat",false);
+		// ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_CLEARCOAT_ROUGHNESS,propName +".clearcoatgloss",false); // TODO
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ANISOTROPIC,propName +".anisotropic",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SHEEN,propName +".sheen",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SHEEN_TINT,propName +".sheentint",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_EMISSION,propName +".emission",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_NORMAL,propName +".normaltex",false,false,true);
+		if(renderer.ShouldUsePhotonGiCache())
+			props<<luxrays::Property(propName +".photongi.enable")("1");
+		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_IOR,propName +".volume.interiorior",false);
+		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_IOR,propName +".volume.exteriorior",false);
+
+		static float factor = 1.f;
+		props<<luxrays::Property(propName +".emission.gain")(factor,factor,factor);
+
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ALPHA,propName +".transparency",false);
+		return props;
+	});
+	RegisterFactory(unirender::NODE_GLASS_BSDF,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto propName = "scene.materials." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("glass");
+		// 0.0031 is the dispersion for water and is only used for testing purposes (see https://wiki.luxcorerender.org/Glass_Material_IOR_and_Dispersion#Refractive_Index_and_Dispersion_Data)
+		// This should be an input parameter!
+		props<<luxrays::Property{propName +".cauchyc"}(0.0031);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glass_bsdf::IN_COLOR,propName +".kr",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glass_bsdf::IN_COLOR,propName +".kt",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glass_bsdf::IN_IOR,propName +".interiorior",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glass_bsdf::IN_IOR,propName +".exteriorior",false);
+		if(renderer.ShouldUsePhotonGiCache())
+			props<<luxrays::Property(propName +".photongi.enable")("1");
 
 		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ALPHA,propName +".transparency",false);
 		return props;
 	});
-	/*RegisterFactory(unirender::NODE_SEPARATE_RGB,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+	RegisterFactory(unirender::NODE_SEPARATE_XYZ,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		luxrays::Properties props {};
-		auto texName = nodeCache.GetNodeName(node);
-		std::string propName = "scene.textures." +texName;
 
-		const std::array<std::string,3> suffixes = {"_r","_g","_b"};
-		const std::array<std::string,3> inputNames = {unirender::nodes::combine_rgb::IN_R,unirender::nodes::combine_rgb::IN_G,unirender::nodes::combine_rgb::IN_B};
-		const std::array<Vector3,3> factors = {Vector3{1.f,0.f,0.f},Vector3{0.f,1.f,0.f},Vector3{0.f,0.f,1.f}};
-		for(uint8_t i=0;i<3;++i)
-		{
-			auto propNameC = propName +suffixes[i];
-			auto &factor = factors[i];
-			props<<luxrays::Property(propNameC +".type")("scale");
-			ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,inputNames[i],propNameC +".texture1",false);
-			props<<luxrays::Property(propNameC +".texture2")(factor.x,factor.y,factor.z);
-		}
+		uint32_t channel = 0;
+		std::string outputSocketName;
+		outputSocket.GetNode(outputSocketName);
+		if(outputSocketName == unirender::nodes::separate_xyz::OUT_X)
+			channel = 0;
+		else if(outputSocketName == unirender::nodes::separate_xyz::OUT_Y)
+			channel = 1;
+		else if(outputSocketName == unirender::nodes::separate_xyz::OUT_Z)
+			channel = 2;
 
-		const std::string rgSuffix = "_rg";
-		auto propNameRg = propName +rgSuffix;
-		props<<luxrays::Property(propNameRg +".type")("add");
-		props<<luxrays::Property(propNameRg +".texture1")(texName +suffixes[0]);
-		props<<luxrays::Property(propNameRg +".texture2")(texName +suffixes[1]);
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("splitfloat3");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::separate_xyz::IN_VECTOR,propName +".texture",false);
 
-		auto propNameRgb = propName;
-		props<<luxrays::Property(propNameRgb +".type")("add");
-		props<<luxrays::Property(propNameRgb +".texture1")(texName +rgSuffix);
-		props<<luxrays::Property(propNameRgb +".texture2")(texName +suffixes[2]);
-		return props;
-	});*/
-	RegisterFactory(unirender::NODE_COMBINE_RGB,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
-		luxrays::Properties props {};
-		auto texName = nodeCache.GetNodeName(node);
-		std::string propName = "scene.textures." +texName;
-
-		const std::array<std::string,3> suffixes = {"_r","_g","_b"};
-		const std::array<std::string,3> inputNames = {unirender::nodes::combine_rgb::IN_R,unirender::nodes::combine_rgb::IN_G,unirender::nodes::combine_rgb::IN_B};
-		const std::array<Vector3,3> factors = {Vector3{1.f,0.f,0.f},Vector3{0.f,1.f,0.f},Vector3{0.f,0.f,1.f}};
-		for(uint8_t i=0;i<3;++i)
-		{
-			auto propNameC = propName +suffixes[i];
-			auto &factor = factors[i];
-			props<<luxrays::Property(propNameC +".type")("scale");
-			ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,inputNames[i],propNameC +".texture1",false);
-			props<<luxrays::Property(propNameC +".texture2")(factor.x,factor.y,factor.z);
-		}
-
-		const std::string rgSuffix = "_rg";
-		auto propNameRg = propName +rgSuffix;
-		props<<luxrays::Property(propNameRg +".type")("add");
-		props<<luxrays::Property(propNameRg +".texture1")(texName +suffixes[0]);
-		props<<luxrays::Property(propNameRg +".texture2")(texName +suffixes[1]);
-
-		auto propNameRgb = propName;
-		props<<luxrays::Property(propNameRgb +".type")("add");
-		props<<luxrays::Property(propNameRgb +".texture1")(texName +rgSuffix);
-		props<<luxrays::Property(propNameRgb +".texture2")(texName +suffixes[2]);
+		props<<luxrays::Property(propName +".channel")(channel);
 		return props;
 	});
-	RegisterFactory(unirender::NODE_IMAGE_TEXTURE,[this](luxcore::Scene &scene,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+	RegisterFactory(unirender::NODE_SEPARATE_RGB,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		luxrays::Properties props {};
-		std::string propName = "scene.textures." +nodeCache.GetNodeName(node);
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("splitfloat3");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::separate_rgb::IN_COLOR,propName +".texture",false);
+
+		uint32_t channel = 0;
+		std::string outputSocketName;
+		outputSocket.GetNode(outputSocketName);
+		if(outputSocketName == unirender::nodes::separate_rgb::OUT_R)
+			channel = 0;
+		else if(outputSocketName == unirender::nodes::separate_rgb::OUT_G)
+			channel = 1;
+		else if(outputSocketName == unirender::nodes::separate_rgb::OUT_B)
+			channel = 2;
+		props<<luxrays::Property(propName +".channel")(channel);
+		return props;
+
+#if 0 // Obsolete
+		luxrays::Properties props {};
+		auto texName = nodeCache.GetNodeName(node);
+		std::string propName = "scene.textures." +texName;
+
+		const std::array<std::string,3> suffixes = {"_r","_g","_b"};
+		const std::array<std::string,3> inputNames = {unirender::nodes::combine_rgb::IN_R,unirender::nodes::combine_rgb::IN_G,unirender::nodes::combine_rgb::IN_B};
+		const std::array<Vector3,3> factors = {Vector3{1.f,0.f,0.f},Vector3{0.f,1.f,0.f},Vector3{0.f,0.f,1.f}};
+		uint32_t outputSocketIdx = 0;
+		std::string outputSocketName;
+		outputSocket.GetNode(outputSocketName);
+		if(outputSocketName == unirender::nodes::separate_rgb::OUT_R)
+			outputSocketIdx = 0;
+		else if(outputSocketName == unirender::nodes::separate_rgb::OUT_G)
+			outputSocketIdx = 1;
+		else if(outputSocketName == unirender::nodes::separate_rgb::OUT_B)
+			outputSocketIdx = 2;
+
+		auto propNameC = propName +suffixes[outputSocketIdx];
+		props<<luxrays::Property(propNameC +".type")("scale");
+		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::separate_rgb::IN_COLOR,propNameC +".texture1",false);
+		auto &factor = factors[outputSocketIdx];
+		props<<luxrays::Property(propNameC +".texture2")(factor.x,factor.y,factor.z); // TODO: Not this! All three values should be same! How to swap?
+		return props;
+#endif
+	});
+	
+	RegisterFactory(unirender::NODE_COMBINE_XYZ,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("makefloat3");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::combine_xyz::IN_X,propName +".texture1",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::combine_xyz::IN_Y,propName +".texture2",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::combine_xyz::IN_Z,propName +".texture3",false);
+		return props;
+	});
+	RegisterFactory(unirender::NODE_COMBINE_RGB,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("makefloat3");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::combine_rgb::IN_R,propName +".texture1",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::combine_rgb::IN_G,propName +".texture2",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::combine_rgb::IN_B,propName +".texture3",false);
+		return props;
+
+#if 0 // Obsolete
+		luxrays::Properties props {};
+		auto texName = nodeCache.GetNodeName(node);
+		std::string propName = "scene.textures." +texName;
+
+		const std::array<std::string,3> suffixes = {"_r","_g","_b"};
+		const std::array<std::string,3> inputNames = {unirender::nodes::combine_rgb::IN_R,unirender::nodes::combine_rgb::IN_G,unirender::nodes::combine_rgb::IN_B};
+		const std::array<Vector3,3> factors = {Vector3{1.f,0.f,0.f},Vector3{0.f,1.f,0.f},Vector3{0.f,0.f,1.f}};
+		for(uint8_t i=0;i<3;++i)
+		{
+			auto propNameC = propName +suffixes[i];
+			auto &factor = factors[i];
+			props<<luxrays::Property(propNameC +".type")("scale");
+			ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,inputNames[i],propNameC +".texture1",false);
+			props<<luxrays::Property(propNameC +".texture2")(factor.x,factor.y,factor.z);
+		}
+
+		const std::string rgSuffix = "_rg";
+		auto propNameRg = propName +rgSuffix;
+		props<<luxrays::Property(propNameRg +".type")("add");
+		props<<luxrays::Property(propNameRg +".texture1")(texName +suffixes[0]);
+		props<<luxrays::Property(propNameRg +".texture2")(texName +suffixes[1]);
+
+		auto propNameRgb = propName;
+		props<<luxrays::Property(propNameRgb +".type")("add");
+		props<<luxrays::Property(propNameRgb +".texture1")(texName +rgSuffix);
+		props<<luxrays::Property(propNameRgb +".texture2")(texName +suffixes[2]);
+		return props;
+#endif
+	});
+	RegisterFactory(unirender::NODE_IMAGE_TEXTURE,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
 		props<<luxrays::Property(propName +".type")("imagemap");
-		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::image_texture::IN_FILENAME,propName +".file");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::image_texture::IN_FILENAME,propName +".file");
+
+		auto sockColorSpace = node.GetInputOrProperty(unirender::nodes::image_texture::IN_COLORSPACE);
+		auto val = sockColorSpace.GetValue();
+		if(val.has_value())
+		{
+			auto colorSpace = val->ToValue<std::string>();
+			if(colorSpace.has_value() && ustring::compare(*colorSpace,unirender::nodes::image_texture::COLOR_SPACE_SRGB) == false)
+				props<<luxrays::Property(propName +".gamma")(1);
+		}
+
+		std::string outputSocketName;
+		outputSocket.GetNode(outputSocketName);
+		if(outputSocketName == unirender::nodes::image_texture::OUT_ALPHA)
+			props<<luxrays::Property(propName +".channel")("alpha");
+		return props;
+	});
+	RegisterFactory(unirender::NODE_NORMAL_MAP,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto texName = nodeCache.ToLinkedSocketName(outputSocket);
+		auto propName = "scene.textures." +texName;
+		props<<luxrays::Property(propName +".type")("scale");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::normal_map::IN_COLOR,propName +".texture1");
+
+		auto texNameStrength = texName +"_strength";
+		auto propNameStrength = "scene.textures." +texNameStrength;
+		props<<luxrays::Property(propNameStrength +".type")("makefloat3");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::normal_map::IN_STRENGTH,propNameStrength +".texture1",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::normal_map::IN_STRENGTH,propNameStrength +".texture2",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::normal_map::IN_STRENGTH,propNameStrength +".texture3",false);
+
+		props<<luxrays::Property(propName +".texture2")(texNameStrength);
+		return props;
+	});
+	RegisterFactory(unirender::NODE_NORMAL_TEXTURE,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+#if 0 // This doesn't seem to work?
+		luxrays::Properties props {};
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("normalmap");
+		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::normal_texture::IN_FILENAME,propName +".file");
+		ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::normal_texture::IN_STRENGTH,propName +".scale");
+#endif
+
+		luxrays::Properties props {};
+		auto propName = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket);
+		props<<luxrays::Property(propName +".type")("imagemap");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::normal_texture::IN_FILENAME,propName +".file");
+		props<<luxrays::Property(propName +".gamma")(1);
+		// TODO: Scale
 		return props;
 	});
 }
@@ -670,11 +806,82 @@ void LuxNodeManager::Initialize()
 ////////////
 
 extern "C" {
-	std::shared_ptr<unirender::Renderer> __declspec(dllexport) test_luxcorerender(const unirender::Scene &scene)
+	std::shared_ptr<unirender::Renderer> __declspec(dllexport) create_renderer(const unirender::Scene &scene)
 	{
 		return Renderer::Create(scene);
 	}
 };
+
+////////////
+
+#define ENABLE_COORDINATE_SYSTEM_CONVERSION
+Vector3 Renderer::ToPragmaPosition(const luxrays::Vector &pos)
+{
+#ifdef ENABLE_COORDINATE_SYSTEM_CONVERSION
+	auto scale = util::pragma::units_to_metres(1.f);
+	Vector3 prPos {pos.x,pos.z,-pos.y};
+	prPos /= scale;
+	return prPos;
+#else
+	return {pos.x,pos.y,pos.z};
+#endif
+}
+luxrays::Vector Renderer::ToLuxVector(const Vector3 &v)
+{
+	return luxrays::Vector{v.x,v.y,v.z};
+}
+luxrays::Point Renderer::ToLuxPosition(const Vector3 &pos)
+{
+#ifdef ENABLE_COORDINATE_SYSTEM_CONVERSION
+	auto scale = util::pragma::units_to_metres(1.f);
+	luxrays::Point cpos {pos.x,-pos.z,pos.y};
+	cpos *= scale;
+	return cpos;
+#else
+	return luxrays::Point{pos.x,pos.y,pos.z};
+#endif
+}
+luxrays::Normal Renderer::ToLuxNormal(const Vector3 &n)
+{
+#ifdef ENABLE_COORDINATE_SYSTEM_CONVERSION
+	return luxrays::Normal{n.x,-n.z,n.y};
+#else
+	return {n.x,n.y,n.z};
+#endif
+}
+luxrays::UV Renderer::ToLuxUV(const Vector2 &uv)
+{
+	return luxrays::UV{uv.x,uv.y};
+}
+
+umath::ScaledTransform Renderer::ToLuxTransform(const umath::ScaledTransform &t,bool applyRotOffset)
+{
+#ifdef ENABLE_COORDINATE_SYSTEM_CONVERSION
+	//auto rot = t.GetRotation();
+	//umath::swap(rot.y,rot.z);
+	//umath::negate(rot.y);
+	Vector3 axis;
+	float angle;
+	uquat::to_axis_angle(t.GetRotation(),axis,angle);
+	axis = {axis.x,-axis.z,axis.y};
+	auto rot = uquat::create(axis,angle);
+	auto lxScale = ToLuxVector(t.GetScale());
+	umath::swap(lxScale.y,lxScale.z);
+	auto lxOrigin = ToLuxPosition(t.GetOrigin());
+	return umath::ScaledTransform {Vector3{lxOrigin.x,lxOrigin.y,lxOrigin.z},rot,Vector3{lxScale.x,lxScale.y,lxScale.z}};
+#else
+	return t;
+#endif
+}
+float Renderer::ToLuxLength(float len)
+{
+#ifdef ENABLE_COORDINATE_SYSTEM_CONVERSION
+	auto scale = util::pragma::units_to_metres(1.f);
+	return len *scale;
+#else
+	return len;
+#endif
+}
 
 std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene)
 {
@@ -682,6 +889,240 @@ std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene)
 	if(renderer->Initialize() == false)
 		return nullptr;
 	return renderer;
+}
+
+std::shared_ptr<Renderer> Renderer::CreateResume()
+{
+	//auto path = util::Path::CreatePath(util::get_program_path()) +"frame.rsm";
+	//m_lxSession->SaveResumeFile(path.GetString());
+	//return true;
+	return nullptr;
+}
+
+std::string Renderer::TranslateOutputTypeToLuxCoreRender(const std::string &type)
+{
+	if(type == OUTPUT_COLOR)
+		return "RGBA";
+	else if(type == OUTPUT_ALBEDO)
+		return "ALBEDO";
+	else if(type == OUTPUT_NORMAL)
+		return "AVG_SHADING_NORMAL";
+	else if(type == OUTPUT_DEPTH)
+		return "DEPTH";
+	else if(type == OUTPUT_ALPHA)
+		return "ALPHA";
+	else if(type == OUTPUT_GEOMETRY_NORMAL)
+		return "GEOMETRY_NORMAL";
+	else if(type == OUTPUT_SHADING_NORMAL)
+		return "SHADING_NORMAL";
+	else if(type == OUTPUT_DIRECT_DIFFUSE)
+		return "DIRECT_DIFFUSE";
+	else if(type == OUTPUT_DIRECT_DIFFUSE_REFLECT)
+		return "DIRECT_DIFFUSE_REFLECT";
+	else if(type == OUTPUT_DIRECT_DIFFUSE_TRANSMIT)
+		return "DIRECT_DIFFUSE_TRANSMIT";
+	else if(type == OUTPUT_DIRECT_GLOSSY)
+		return "DIRECT_GLOSSY";
+	else if(type == OUTPUT_DIRECT_GLOSSY_REFLECT)
+		return "DIRECT_GLOSSY_REFLECT";
+	else if(type == OUTPUT_DIRECT_GLOSSY_TRANSMIT)
+		return "DIRECT_GLOSSY_TRANSMIT";
+	else if(type == OUTPUT_EMISSION)
+		return "EMISSION";
+	else if(type == OUTPUT_INDIRECT_DIFFUSE)
+		return "INDIRECT_DIFFUSE";
+	else if(type == OUTPUT_INDIRECT_DIFFUSE_REFLECT)
+		return "INDIRECT_DIFFUSE_REFLECT";
+	else if(type == OUTPUT_INDIRECT_DIFFUSE_TRANSMIT)
+		return "INDIRECT_DIFFUSE_TRANSMIT";
+	else if(type == OUTPUT_INDIRECT_GLOSSY)
+		return "INDIRECT_GLOSSY";
+	else if(type == OUTPUT_INDIRECT_GLOSSY_REFLECT)
+		return "INDIRECT_GLOSSY_REFLECT";
+	else if(type == OUTPUT_INDIRECT_GLOSSY_TRANSMIT)
+		return "INDIRECT_GLOSSY_TRANSMIT";
+	else if(type == OUTPUT_INDIRECT_SPECULAR)
+		return "INDIRECT_SPECULAR";
+	else if(type == OUTPUT_INDIRECT_SPECULAR_REFLECT)
+		return "INDIRECT_SPECULAR_REFLECT";
+	else if(type == OUTPUT_INDIRECT_SPECULAR_TRANSMIT)
+		return "INDIRECT_SPECULAR_TRANSMIT";
+	else if(type == OUTPUT_UV)
+		return "UV";
+	else if(type == OUTPUT_IRRADIANCE)
+		return "IRRADIANCE";
+	else if(type == OUTPUT_NOISE)
+		return "NOISE";
+	else if(type == OUTPUT_CAUSTIC)
+		return "CAUSTIC";
+	return type.c_str();
+}
+
+uimg::ImageBuffer::Format Renderer::GetOutputFormat(Scene::RenderMode renderMode)
+{
+	switch(renderMode)
+	{
+	case Scene::RenderMode::RenderImage:
+	case Scene::RenderMode::BakeDiffuseLighting:
+		return uimg::ImageBuffer::Format::RGBA32;
+	case Scene::RenderMode::SceneAlbedo:
+	case Scene::RenderMode::SceneNormals:
+	case Scene::RenderMode::GeometryNormal:
+	case Scene::RenderMode::ShadingNormal:
+	case Scene::RenderMode::DirectDiffuse:
+	case Scene::RenderMode::DirectDiffuseReflect:
+	case Scene::RenderMode::DirectDiffuseTransmit:
+	case Scene::RenderMode::DirectGlossy:
+	case Scene::RenderMode::DirectGlossyReflect:
+	case Scene::RenderMode::DirectGlossyTransmit:
+	case Scene::RenderMode::Emission:
+	case Scene::RenderMode::IndirectDiffuse:
+	case Scene::RenderMode::IndirectDiffuseReflect:
+	case Scene::RenderMode::IndirectDiffuseTransmit:
+	case Scene::RenderMode::IndirectGlossy:
+	case Scene::RenderMode::IndirectGlossyReflect:
+	case Scene::RenderMode::IndirectGlossyTransmit:
+	case Scene::RenderMode::IndirectSpecular:
+	case Scene::RenderMode::IndirectSpecularReflect:
+	case Scene::RenderMode::IndirectSpecularTransmit:
+	case Scene::RenderMode::Irradiance:
+	case Scene::RenderMode::Caustic:
+		return uimg::ImageBuffer::Format::RGB32;
+	case Scene::RenderMode::Uv:
+		return uimg::ImageBuffer::Format::RG32;
+	case Scene::RenderMode::SceneDepth:
+	case Scene::RenderMode::Noise:
+	case Scene::RenderMode::Alpha:
+		return uimg::ImageBuffer::Format::R32;
+	}
+	return uimg::ImageBuffer::Format::RGBA32;
+}
+
+luxcore::Film::FilmOutputType Renderer::GetLuxCoreFilmOutputType(Scene::RenderMode renderMode)
+{
+	switch(renderMode)
+	{
+	case Scene::RenderMode::RenderImage:
+	case Scene::RenderMode::BakeDiffuseLighting:
+		return luxcore::Film::FilmOutputType::OUTPUT_RGBA;
+	case Scene::RenderMode::SceneAlbedo:
+		return luxcore::Film::FilmOutputType::OUTPUT_ALBEDO;
+	case Scene::RenderMode::SceneNormals:
+		return luxcore::Film::FilmOutputType::OUTPUT_AVG_SHADING_NORMAL;
+	case Scene::RenderMode::SceneDepth:
+		return luxcore::Film::FilmOutputType::OUTPUT_DEPTH;
+	case Scene::RenderMode::Alpha:
+		return luxcore::Film::FilmOutputType::OUTPUT_ALPHA;
+	case Scene::RenderMode::GeometryNormal:
+		return luxcore::Film::FilmOutputType::OUTPUT_GEOMETRY_NORMAL;
+	case Scene::RenderMode::ShadingNormal:
+		return luxcore::Film::FilmOutputType::OUTPUT_SHADING_NORMAL;
+	case Scene::RenderMode::DirectDiffuse:
+		return luxcore::Film::FilmOutputType::OUTPUT_DIRECT_DIFFUSE;
+	case Scene::RenderMode::DirectDiffuseReflect:
+		return luxcore::Film::FilmOutputType::OUTPUT_DIRECT_DIFFUSE_REFLECT;
+	case Scene::RenderMode::DirectDiffuseTransmit:
+		return luxcore::Film::FilmOutputType::OUTPUT_DIRECT_DIFFUSE_TRANSMIT;
+	case Scene::RenderMode::DirectGlossy:
+		return luxcore::Film::FilmOutputType::OUTPUT_DIRECT_GLOSSY;
+	case Scene::RenderMode::DirectGlossyReflect:
+		return luxcore::Film::FilmOutputType::OUTPUT_DIRECT_GLOSSY_REFLECT;
+	case Scene::RenderMode::DirectGlossyTransmit:
+		return luxcore::Film::FilmOutputType::OUTPUT_DIRECT_GLOSSY_TRANSMIT;
+	case Scene::RenderMode::Emission:
+		return luxcore::Film::FilmOutputType::OUTPUT_EMISSION;
+	case Scene::RenderMode::IndirectDiffuse:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_DIFFUSE;
+	case Scene::RenderMode::IndirectDiffuseReflect:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_DIFFUSE_REFLECT;
+	case Scene::RenderMode::IndirectDiffuseTransmit:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_DIFFUSE_TRANSMIT;
+	case Scene::RenderMode::IndirectGlossy:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_GLOSSY;
+	case Scene::RenderMode::IndirectGlossyReflect:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_GLOSSY_REFLECT;
+	case Scene::RenderMode::IndirectGlossyTransmit:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_GLOSSY_TRANSMIT;
+	case Scene::RenderMode::IndirectSpecular:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_SPECULAR;
+	case Scene::RenderMode::IndirectSpecularReflect:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_SPECULAR_REFLECT;
+	case Scene::RenderMode::IndirectSpecularTransmit:
+		return luxcore::Film::FilmOutputType::OUTPUT_INDIRECT_SPECULAR_TRANSMIT;
+	case Scene::RenderMode::Uv:
+		return luxcore::Film::FilmOutputType::OUTPUT_UV;
+	case Scene::RenderMode::Irradiance:
+		return luxcore::Film::FilmOutputType::OUTPUT_IRRADIANCE;
+	case Scene::RenderMode::Noise:
+		return luxcore::Film::FilmOutputType::OUTPUT_NOISE;
+	case Scene::RenderMode::Caustic:
+		return luxcore::Film::FilmOutputType::OUTPUT_CAUSTIC;
+	}
+	return luxcore::Film::FilmOutputType::OUTPUT_RGBA;
+}
+
+std::string Renderer::GetOutputType(Scene::RenderMode renderMode)
+{
+	switch(renderMode)
+	{
+	case Scene::RenderMode::RenderImage:
+		return OUTPUT_COLOR;
+	case Scene::RenderMode::BakeDiffuseLighting:
+		return OUTPUT_COLOR;
+	case Scene::RenderMode::SceneAlbedo:
+		return OUTPUT_ALBEDO;
+	case Scene::RenderMode::SceneNormals:
+		return OUTPUT_NORMAL;
+	case Scene::RenderMode::SceneDepth:
+		return OUTPUT_DEPTH;
+	case Scene::RenderMode::Alpha:
+		return OUTPUT_ALPHA;
+	case Scene::RenderMode::GeometryNormal:
+		return OUTPUT_GEOMETRY_NORMAL;
+	case Scene::RenderMode::ShadingNormal:
+		return OUTPUT_SHADING_NORMAL;
+	case Scene::RenderMode::DirectDiffuse:
+		return OUTPUT_DIRECT_DIFFUSE;
+	case Scene::RenderMode::DirectDiffuseReflect:
+		return OUTPUT_DIRECT_DIFFUSE_REFLECT;
+	case Scene::RenderMode::DirectDiffuseTransmit:
+		return OUTPUT_DIRECT_DIFFUSE_TRANSMIT;
+	case Scene::RenderMode::DirectGlossy:
+		return OUTPUT_DIRECT_GLOSSY;
+	case Scene::RenderMode::DirectGlossyReflect:
+		return OUTPUT_DIRECT_GLOSSY_REFLECT;
+	case Scene::RenderMode::DirectGlossyTransmit:
+		return OUTPUT_DIRECT_GLOSSY_TRANSMIT;
+	case Scene::RenderMode::Emission:
+		return OUTPUT_EMISSION;
+	case Scene::RenderMode::IndirectDiffuse:
+		return OUTPUT_INDIRECT_DIFFUSE;
+	case Scene::RenderMode::IndirectDiffuseReflect:
+		return OUTPUT_INDIRECT_DIFFUSE_REFLECT;
+	case Scene::RenderMode::IndirectDiffuseTransmit:
+		return OUTPUT_INDIRECT_DIFFUSE_TRANSMIT;
+	case Scene::RenderMode::IndirectGlossy:
+		return OUTPUT_INDIRECT_GLOSSY;
+	case Scene::RenderMode::IndirectGlossyReflect:
+		return OUTPUT_INDIRECT_GLOSSY_REFLECT;
+	case Scene::RenderMode::IndirectGlossyTransmit:
+		return OUTPUT_INDIRECT_GLOSSY_TRANSMIT;
+	case Scene::RenderMode::IndirectSpecular:
+		return OUTPUT_INDIRECT_SPECULAR;
+	case Scene::RenderMode::IndirectSpecularReflect:
+		return OUTPUT_INDIRECT_SPECULAR_REFLECT;
+	case Scene::RenderMode::IndirectSpecularTransmit:
+		return OUTPUT_INDIRECT_SPECULAR_TRANSMIT;
+	case Scene::RenderMode::Uv:
+		return OUTPUT_UV;
+	case Scene::RenderMode::Irradiance:
+		return OUTPUT_IRRADIANCE;
+	case Scene::RenderMode::Noise:
+		return OUTPUT_NOISE;
+	case Scene::RenderMode::Caustic:
+		return OUTPUT_CAUSTIC;
+	}
+	return "";
 }
 
 Renderer::~Renderer()
@@ -717,8 +1158,7 @@ void Renderer::Wait()
 {
 	StopRenderSession();
 }
-float Renderer::GetProgress() const
-{return 1.f;}
+float Renderer::GetProgress() const {return m_progress;}
 void Renderer::Reset()
 {
 	StopRenderSession();
@@ -727,7 +1167,54 @@ void Renderer::Restart()
 {
 	StopRenderSession();
 }
-void Renderer::FinalizeImage(uimg::ImageBuffer &imgBuf) {imgBuf.FlipVertically();}
+bool Renderer::Stop()
+{
+	m_lxSession->Stop();
+	return true;
+}
+bool Renderer::Pause()
+{
+	m_lxSession->Pause();
+	return true;
+}
+bool Renderer::Resume()
+{
+	m_lxSession->Resume();
+	return true;
+}
+bool Renderer::Suspend()
+{
+	Pause();
+	auto path = util::Path::CreatePath(util::get_program_path()) +"frame.rsm";
+	m_lxSession->SaveResumeFile(path.GetString());
+	return true;
+}
+bool Renderer::Export(const std::string &strPath)
+{
+	FileManager::CreatePath(strPath.c_str());
+	auto path = util::Path::CreatePath(util::get_program_path()) +strPath;
+	m_lxConfig->Export(path.GetString());
+	return true;
+}
+std::optional<std::string> Renderer::SaveRenderPreview(const std::string &relPath,std::string &outErr) const
+{
+	auto path = util::Path::CreatePath(util::get_program_path()) +relPath;
+	std::string fileName = "render_preview.exr";
+	auto &film = m_lxSession->GetFilm();
+	film.SaveOutput((path +fileName).GetString(),luxcore::Film::FilmOutputType::OUTPUT_RGBA,{});
+	return (path +fileName).GetString();
+}
+void Renderer::FinalizeImage(uimg::ImageBuffer &imgBuf,StereoEye eyeStage)
+{
+	auto &resultAlphaBuf = GetResultImageBuffer(OUTPUT_ALPHA,eyeStage);
+	if(resultAlphaBuf)
+	{
+		for(auto &px : *resultAlphaBuf)
+			imgBuf.GetPixelView(px.GetX(),px.GetY()).SetValue(uimg::ImageBuffer::Channel::A,px.GetFloatValue(uimg::ImageBuffer::Channel::R));
+	}
+
+	imgBuf.FlipVertically();
+}
 util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye eyeStage,unirender::Renderer::RenderStageResult *optResult)
 {
 	auto reply = unirender::Renderer::HandleRenderStage(worker,stage,eyeStage,optResult);
@@ -755,16 +1242,21 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 			auto &createInfo = m_scene->GetCreateInfo();
 			const unsigned int haltTime = m_lxSession->GetRenderConfig().GetProperties().Get(luxrays::Property("batch.halttime")(4'320'000)).Get<unsigned int>();
 			const unsigned int haltSpp = m_lxSession->GetRenderConfig().GetProperties().Get(luxrays::Property("batch.haltspp")(createInfo.samples.has_value() ? *createInfo.samples : 0)).Get<unsigned int>();
+			const unsigned int haltNoise = m_lxSession->GetRenderConfig().GetProperties().Get(luxrays::Property("batch.haltnoisethreshold")(0.03)).Get<double>();
 
 			char buf[512];
 			const auto &stats = m_lxSession->GetStats();
+			auto &film = m_lxSession->GetFilm();
 			while (!m_lxSession->HasDone()) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
+				if(m_lxSession->IsInPause())
+					continue;
 				m_lxSession->UpdateStats();
 				const double elapsedTime = stats.Get("stats.renderengine.time").Get<double>();
 				const unsigned int pass = stats.Get("stats.renderengine.pass").Get<unsigned int>();
 				const float convergence = stats.Get("stats.renderengine.convergence").Get<unsigned int>();
+				m_progress = pass /static_cast<double>(haltSpp);
+				worker.UpdateProgress(m_progress);
 		
 				// Print some information about the rendering progress
 				sprintf(buf, "[Elapsed time: %3d/%dsec][Samples %4d/%d][Convergence %f%%][Avg. samples/sec % 3.2fM on %.1fK tris]",
@@ -774,34 +1266,177 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 
 				LC_LOG(buf);
 			}
-			auto &film = m_lxSession->GetFilm();
-			auto &resultImageBuffer = GetResultImageBuffer(eyeStage);
-			film.SaveOutputs();
-			resultImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGBA_FLOAT);
-			try
+			
+			auto &resultImageBuffer = GetResultImageBuffer(OUTPUT_COLOR,eyeStage);
+			auto renderMode = m_scene->GetRenderMode();
+			auto width = film.GetWidth();
+			auto height = film.GetHeight();
+			switch(renderMode)
 			{
-				film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_RGBA,static_cast<float*>(resultImageBuffer->GetData()));
-			}
-			catch(const std::exception &e)
+			case Scene::RenderMode::RenderImage:
+			case Scene::RenderMode::BakeDiffuseLighting:
 			{
-				std::cout<<"EX: "<<e.what()<<std::endl;
-			}
+				auto bakeLightmaps = (renderMode == Scene::RenderMode::BakeDiffuseLighting);
+				if(bakeLightmaps)
+				{
+					// LuxCoreRender currently doesn't provide a way to get bake data directly, so we'll have to save it to
+					// an image file, then read it and delete it once we're done.
+					film.SaveOutputs();
 
-			if(UpdateStereoEye(worker,stage,eyeStage))
+#if 0
+					auto f = FileManager::OpenFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME,"rb");
+					if(f == nullptr)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Unable to open lightmap atlas exr file!");
+						return RenderStageResult::Complete;
+					}
+					std::vector<uint8_t> exrData;
+					auto size = f->GetSize();
+					exrData.resize(size);
+					f->Read(exrData.data(),size);
+					f = nullptr;
+					FileManager::RemoveFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME);
+
+					EXRVersion exrVersion {};
+					if(ParseEXRVersionFromMemory(&exrVersion,exrData.data(),exrData.size()) != TINYEXR_SUCCESS)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Unable to parse exr version for lightmap atlas!");
+						return RenderStageResult::Complete;
+					}
+					const char *err = nullptr;
+					EXRHeader exrHeader {};
+					InitEXRHeader(&exrHeader);
+					if(ParseEXRHeaderFromMemory(&exrHeader,&exrVersion,exrData.data(),exrData.size(),&err) != TINYEXR_SUCCESS)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Unable to parse exr header for lightmap atlas!");
+						FreeEXRErrorMessage(err);
+						return RenderStageResult::Complete;
+					}
+					util::ScopeGuard sgHeader {[&exrHeader]() {FreeEXRHeader(&exrHeader);}};
+					assert(exrHeader.pixel_types[0] == TINYEXR_PIXELTYPE_FLOAT);
+					if(exrHeader.pixel_types[0] != TINYEXR_PIXELTYPE_FLOAT)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Lightmap atlas exr has incorrect pixel format!");
+						return RenderStageResult::Complete;
+					}
+					EXRImage exrImg {};
+					InitEXRImage(&exrImg);
+					if(LoadEXRImageFromMemory(&exrImg,&exrHeader,exrData.data(),exrData.size(),&err) != TINYEXR_SUCCESS)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Unable to load exr image data for lightmap atlas!");
+						FreeEXRErrorMessage(err);
+						return RenderStageResult::Complete;
+					}
+					util::ScopeGuard sgImg {[&exrImg]() {FreeEXRImage(&exrImg);}};
+					width = exrImg.width;
+					height = exrImg.height;
+					assert(exrImg.num_channels == 4);
+					if(exrImg.num_channels != 4)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Lightmap atlas exr has incorrect number of channels!");
+						return RenderStageResult::Complete;
+					}
+					resultImageBuffer = uimg::ImageBuffer::Create(width,height,uimg::ImageBuffer::Format::RGBA_FLOAT);
+					memcpy(resultImageBuffer->GetData(),exrImg.images[0],resultImageBuffer->GetSize());
+#else
+					// Technically deprecated, but above code doesn't work
+					// TODO: Fix the above code and use it instead
+					float *rgba;
+					int w,h;
+					const char *err;
+					auto path = util::Path::CreatePath(util::get_program_path()) +LIGHTMAP_ATLAS_OUTPUT_FILENAME;
+					auto result = LoadEXR(&rgba,&w,&h,path.GetString().c_str(),&err);
+					// FileManager::RemoveFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME);
+					if(result != TINYEXR_SUCCESS)
+					{
+						worker.SetStatus(util::JobStatus::Failed,"Unable to load lightmap exr atlas: " +std::string{err});
+						return RenderStageResult::Complete;
+					}
+					width = w;
+					height = h;
+					resultImageBuffer = uimg::ImageBuffer::CreateWithCustomDeleter(rgba,width,height,uimg::ImageBuffer::Format::RGBA_FLOAT,[](void *ptr) {free(ptr);});
+					resultImageBuffer->FlipVertically();
+#endif
+				}
+				else
+				{
+					resultImageBuffer = uimg::ImageBuffer::Create(width,height,GetOutputFormat(renderMode));
+					try
+					{
+						// film.AsyncExecuteImagePipeline(0);
+						film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_RGBA,static_cast<float*>(resultImageBuffer->GetData()));
+					}
+					catch(const std::exception &e)
+					{
+						std::cout<<"EX: "<<e.what()<<std::endl;
+					}
+				}
+				float exposureMul = 0.02f;
+				resultImageBuffer->ApplyExposure(GetScene().GetCreateInfo().exposure *exposureMul); // Factor is subjective to match Cycles behavior
+				/*auto exposure = GetScene().GetCreateInfo().exposure;
+				for(auto &pxView : *resultImageBuffer)
+				{
+					pxView.SetValue(uimg::ImageBuffer::Channel::R,pxView.GetFloatValue(uimg::ImageBuffer::Channel::R) *exposure);
+					pxView.SetValue(uimg::ImageBuffer::Channel::G,pxView.GetFloatValue(uimg::ImageBuffer::Channel::G) *exposure);
+					pxView.SetValue(uimg::ImageBuffer::Channel::B,pxView.GetFloatValue(uimg::ImageBuffer::Channel::B) *exposure);
+				}*/
+
+				if(bakeLightmaps == false)
+				{
+					auto itAlpha = m_outputs.find(OUTPUT_ALPHA);
+					if(itAlpha != m_outputs.end())
+					{
+						auto &resultAlphaBuf = GetResultImageBuffer(OUTPUT_ALPHA,eyeStage);
+						resultAlphaBuf = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::R32);
+						film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_ALPHA,static_cast<float*>(resultAlphaBuf->GetData()));
+					}
+				}
+
+				if(UpdateStereoEye(worker,stage,eyeStage))
+				{
+					worker.Start(); // Lighting stage for the left eye is triggered by the user, but we have to start it manually for the right eye
+					return RenderStageResult::Continue;
+				}
+
+				// Note: Denoising is handled by LuxCoreRender internally
+				//return StartNextRenderStage(worker,ImageRenderStage::FinalizeImage,eyeStage);
+				if(m_scene->ShouldDenoise() == false)
+					return StartNextRenderStage(worker,ImageRenderStage::FinalizeImage,eyeStage);
+
+				if(bakeLightmaps == false)
+				{
+					auto &albedoImageBuffer = GetResultImageBuffer(OUTPUT_ALBEDO,eyeStage);
+					auto &normalImageBuffer = GetResultImageBuffer(OUTPUT_NORMAL,eyeStage);
+					albedoImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGB_FLOAT);
+					normalImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGB_FLOAT);
+					film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_ALBEDO,static_cast<float*>(albedoImageBuffer->GetData()));
+					film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_AVG_SHADING_NORMAL,static_cast<float*>(normalImageBuffer->GetData()));
+					albedoImageBuffer->ClearAlpha();
+					normalImageBuffer->ClearAlpha();
+
+					static auto dbgOutputAlbedo = false;
+					if(dbgOutputAlbedo)
+						resultImageBuffer = albedoImageBuffer->Copy(uimg::ImageBuffer::Format::RGBA_FLOAT);
+				}
+				break;
+			}
+			default:
 			{
-				worker.Start(); // Lighting stage for the left eye is triggered by the user, but we have to start it manually for the right eye
-				return RenderStageResult::Continue;
+				resultImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),GetOutputFormat(renderMode));
+				film.GetOutput<float>(GetLuxCoreFilmOutputType(renderMode),static_cast<float*>(resultImageBuffer->GetData()));
+				auto numChannels = resultImageBuffer->GetChannelCount();
+				resultImageBuffer->Convert(uimg::ImageBuffer::Format::RGBA32);
+				if(numChannels == 1)
+				{
+					for(auto &pxView : *resultImageBuffer)
+					{
+						pxView.SetValue(uimg::ImageBuffer::Channel::G,pxView.GetFloatValue(uimg::ImageBuffer::Channel::R));
+						pxView.SetValue(uimg::ImageBuffer::Channel::B,pxView.GetFloatValue(uimg::ImageBuffer::Channel::R));
+					}
+				}
+				break;
 			}
-
-			if(m_scene->ShouldDenoise() == false)
-				return StartNextRenderStage(worker,ImageRenderStage::FinalizeImage,eyeStage);
-
-			auto &albedoImageBuffer = GetAlbedoImageBuffer(eyeStage);
-			auto &normalImageBuffer = GetNormalImageBuffer(eyeStage);
-			albedoImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGB_FLOAT);
-			normalImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGB_FLOAT);
-			film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_ALBEDO,static_cast<float*>(albedoImageBuffer->GetData()));
-			film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_SHADING_NORMAL,static_cast<float*>(normalImageBuffer->GetData()));
+			}
 			return StartNextRenderStage(worker,ImageRenderStage::Denoise,eyeStage);
 		});
 		break;
@@ -810,6 +1445,55 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 	if(optResult)
 		*optResult = unirender::Renderer::RenderStageResult::Continue;
 	return util::EventReply::Handled;
+}
+bool Renderer::FinalizeLightmap(const std::string &inputPath,const std::string &outputPath)
+{
+	float *rgba;
+	int w,h;
+	const char *err;
+	auto path = util::Path::CreatePath(util::get_program_path()) +inputPath;
+	auto result = LoadEXR(&rgba,&w,&h,path.GetString().c_str(),&err);
+	// FileManager::RemoveFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME);
+	if(result != TINYEXR_SUCCESS)
+		return false;
+	uint32_t width = w;
+	uint32_t height = h;
+	auto resultImageBuffer = uimg::ImageBuffer::CreateWithCustomDeleter(rgba,width,height,uimg::ImageBuffer::Format::RGBA_FLOAT,[](void *ptr) {free(ptr);});
+	resultImageBuffer->FlipVertically();
+
+	float exposureMul = 0.02f;
+	resultImageBuffer->ApplyExposure(GetScene().GetCreateInfo().exposure *exposureMul); // Factor is subjective to match Cycles behavior
+
+	// Denoise
+	DenoiseInfo denoiseInfo {};
+	denoiseInfo.hdr = true;
+	denoiseInfo.width = resultImageBuffer->GetWidth();
+	denoiseInfo.height = resultImageBuffer->GetHeight();
+	denoiseInfo.lightmap = true;
+
+	resultImageBuffer->Convert(uimg::ImageBuffer::Format::RGB_FLOAT);
+	denoise(denoiseInfo,*resultImageBuffer,nullptr,nullptr,[this](float progress) -> bool {
+		return true;
+	});
+
+	if(m_colorTransformProcessor) // TODO: Should we really apply color transform if we're not denoising?
+	{
+		std::string err;
+		if(m_colorTransformProcessor->Apply(*resultImageBuffer,err,0.f,m_scene->GetGamma()) == false)
+			m_scene->HandleError("Unable to apply color transform: " +err);
+	}
+	resultImageBuffer->Convert(uimg::ImageBuffer::Format::RGBA_HDR);
+	resultImageBuffer->ClearAlpha();
+	FinalizeImage(*resultImageBuffer,unirender::Renderer::StereoEye::Left);
+
+	uimg::TextureInfo texInfo {};
+	texInfo.containerFormat = uimg::TextureInfo::ContainerFormat::DDS;
+	texInfo.inputFormat = uimg::TextureInfo::InputFormat::R16G16B16A16_Float;
+	texInfo.outputFormat = uimg::TextureInfo::OutputFormat::BC6;
+	texInfo.flags = uimg::TextureInfo::Flags::GenerateMipmaps;
+//	auto f = FileManager::OpenFile<VFilePtrReal>("materials/maps/sfm_gtav_mp_apa_06/lightmap_atlas.dds","wb");
+//	if(f)
+	return uimg::save_texture(outputPath,*resultImageBuffer,texInfo,false);
 }
 bool Renderer::UpdateStereoEye(unirender::RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye &eyeStage)
 {
@@ -831,7 +1515,23 @@ bool Renderer::UpdateStereoEye(unirender::RenderWorker &worker,unirender::Render
 	}
 	return false;
 }
-void Renderer::CloseRenderScene() {StopRenderSession();}
+void Renderer::CloseRenderScene()
+{
+	/*if(m_scene->GetRenderMode() == Scene::RenderMode::BakeDiffuseLighting)
+	{
+		auto &resultImageBuffer = GetResultImageBuffer(OUTPUT_COLOR);
+		if(resultImageBuffer)
+		{
+			uimg::TextureInfo texInfo {};
+			texInfo.containerFormat = uimg::TextureInfo::ContainerFormat::DDS;
+			texInfo.inputFormat = uimg::TextureInfo::InputFormat::R16G16B16A16_Float;
+			texInfo.outputFormat = uimg::TextureInfo::OutputFormat::BC6;
+			texInfo.flags = uimg::TextureInfo::Flags::GenerateMipmaps;
+			uimg::save_texture("render/lightmap_atlas.dds",*resultImageBuffer,texInfo,false);
+		}
+	}*/
+	StopRenderSession();
+}
 util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> Renderer::StartRender()
 {
 	auto job = util::create_parallel_job<RenderWorker>(*this);
@@ -843,9 +1543,18 @@ util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> Renderer::StartRender()
 bool Renderer::Initialize()
 {
 	PrepareCyclesSceneForRendering();
-	luxcore::Init([](const char *msg) {
-		std::cout<<"Luxcore: "<<msg<<std::endl;
-	});
+	auto &logHandler = unirender::get_log_handler();
+	luxcore::Init();
+	if(logHandler)
+	{
+		luxcore::SetLogHandler([](const char *msg) {
+			auto &logHandler = unirender::get_log_handler();
+			if(logHandler)
+				logHandler(msg);
+		});
+	}
+	else
+		luxcore::SetLogHandler();
 	std::unique_ptr<luxcore::Scene> lcScene{luxcore::Scene::Create()};
 	if(lcScene == nullptr)
 		return false;
@@ -854,34 +1563,56 @@ bool Renderer::Initialize()
 		auto &sceneInfo = m_scene->GetSceneInfo();
 		auto &skyTex = sceneInfo.sky;
 
-		static Vector3 gain {0.1f,0.1f,0.1f};
+		auto mulFactor = 50.f; // Factor of 50 matches Cycles very closely, reason unknown
+		Vector3 gain {sceneInfo.skyStrength,sceneInfo.skyStrength,sceneInfo.skyStrength};
+		gain *= mulFactor;
+		float gamma = 1.0;
 		auto absPath = Scene::GetAbsSkyPath(skyTex);
 		if(absPath.has_value())
 		{
+			std::string propName = "scene.lights.sky";
+			umath::ScaledTransform pose {};
+			pose.SetRotation(uquat::create(sceneInfo.skyAngles));
+			pose.SetScale(Vector3{-1.f,1.f,1.f});
 			lcScene->Parse(
-				luxrays::Property("scene.lights.sky.type")("infinite")<<
-				luxrays::Property("scene.lights.sky.file")(*absPath)<<
-				luxrays::Property("scene.lights.sky.gain")(gain.x,gain.y,gain.z)<<
-				luxrays::Property("scene.lights.sky.gamma")(1.0)
+				luxrays::Property(propName +".type")("infinite")<<
+				luxrays::Property(propName +".file")(*absPath)<<
+				luxrays::Property(propName +".gain")(gain.x,gain.y,gain.z)<<
+				luxrays::Property(propName +".gamma")(gamma)<<
+				to_luxcore_matrix(propName +".transformation",pose)
 			);
 		}
-
-	/*lcScene->Parse(
-		luxrays::Property("scene.lights.skyl.type")("sky2") <<
-		luxrays::Property("scene.lights.skyl.dir")(0.166974f, 0.59908f, 0.783085f) <<
-		luxrays::Property("scene.lights.skyl.turbidity")(2.2f) <<
-		luxrays::Property("scene.lights.skyl.gain")(0.8f, 0.8f, 0.8f) <<
-		luxrays::Property("scene.lights.sunl.type")("sun") <<
-		luxrays::Property("scene.lights.sunl.dir")(0.166974f, 0.59908f, 0.783085f) <<
-		luxrays::Property("scene.lights.sunl.turbidity")(2.2f) <<
-		luxrays::Property("scene.lights.sunl.gain")(0.8f, 0.8f, 0.8f)
-	);*/
 	
+	m_bakeTarget = FindObject("bake_target");
+
 	m_lxScene = std::move(lcScene);
 	SyncCamera(m_scene->GetCamera());
 	auto &mdlCache = m_renderData.modelCache;
+	mdlCache->GenerateData();
+	uint32_t objId = 0;
+	uint32_t meshId = 0;
+	for(auto &chunk : mdlCache->GetChunks())
+	{
+		for(auto &o : chunk.GetObjects())
+		{
+			o->SetId(objId++);
+			o->Finalize(*m_scene);
+		}
+		for(auto &o : chunk.GetMeshes())
+		{
+			o->SetId(meshId++);
+			o->Finalize(*m_scene);
+		}
+	}
+	for(auto &shader : m_renderData.shaderCache->GetShaders())
+		shader->Finalize();
+
+	uint32_t lightId = 0;
 	for(auto &light : m_scene->GetLights())
+	{
+		light->SetId(lightId++);
 		SyncLight(*light);
+	}
 	for(auto &chunk : mdlCache->GetChunks())
 	{
 		for(auto &o : chunk.GetMeshes())
@@ -894,30 +1625,201 @@ bool Renderer::Initialize()
 			SyncObject(*o);
 	}
 
-	//RTPATHCPU
-	auto &createInfo = m_scene->GetCreateInfo();
+	auto &createInfo = const_cast<unirender::Scene::CreateInfo&>(m_scene->GetCreateInfo());
 	auto resolution = m_scene->GetResolution();
+
+	// TODO: Move this to shared code
+	if(createInfo.colorTransform.has_value())
+	{
+		std::string err;
+		ColorTransformProcessorCreateInfo ctpCreateInfo {};
+		ctpCreateInfo.config = createInfo.colorTransform->config;
+		ctpCreateInfo.lookName = createInfo.colorTransform->lookName;
+		m_colorTransformProcessor = create_color_transform_processor(ctpCreateInfo,err);
+		if(m_colorTransformProcessor == nullptr)
+			m_scene->HandleError("Unable to initialize color transform processor: " +err);
+	}
 
 	luxrays::Properties props {};
 
+	auto renderMode = m_scene->GetRenderMode();
 	std::string renderEngineType = "PATHCPU";
-	switch(createInfo.deviceType)
+	switch(m_renderEngine)
 	{
-	case unirender::Scene::DeviceType::GPU:
-		renderEngineType = "PATHOCL";
+	case RenderEngine::PathTracer:
+		renderEngineType = (createInfo.deviceType == unirender::Scene::DeviceType::GPU) ? "PATHOCL" : "PATHCPU";
+		break;
+	case RenderEngine::TiledPathTracer:
+		renderEngineType = (createInfo.deviceType == unirender::Scene::DeviceType::GPU) ? "TILEPATHOCL" : "TILEPATHCPU";
+		break;
+	case RenderEngine::BidirectionalPathTracer:
+		renderEngineType = "BIDIRCPU";
+		createInfo.deviceType = unirender::Scene::DeviceType::CPU; // Not available for GPU
+		break;
+	case RenderEngine::RealTime:
+		renderEngineType = (createInfo.deviceType == unirender::Scene::DeviceType::GPU) ? "RTPATHOCL" : "RTPATHCPU";
 		break;
 	}
+	// TODO: RTPATHCPU for scene editing
+	// TODO: RTPATHOCL real-time?
+	auto bakeLightmaps = (renderMode == unirender::Scene::RenderMode::BakeDiffuseLighting);
+	if(bakeLightmaps)
+	{
+		renderEngineType = "BAKECPU"; // TODO: Use GPU renderer once available
+		createInfo.deviceType = unirender::Scene::DeviceType::CPU; // Not available for GPU
+		m_renderEngine = RenderEngine::Bake;
+	}
+	else
+		m_bakeTarget = nullptr;
 
 	props<<luxrays::Property("renderengine.type")(renderEngineType);
-	props<<luxrays::Property("sampler.type")("SOBOL");
+	if(renderEngineType == "TILEPATHCPU" || renderEngineType == "RTPATHOCL" || renderEngineType == "TILEPATHOCL")
+		props<<luxrays::Property("sampler.type")("TILEPATHSAMPLER");
+	else if(renderEngineType == "RTPATHCPU")
+		props<<luxrays::Property("sampler.type")("RTPATHCPUSAMPLER");
+	else
+		props<<luxrays::Property("sampler.type")("SOBOL");
 	props<<luxrays::Property("batch.halttime")(4'320'000);
 	props<<luxrays::Property("context.cuda.optix.enable")("1");
-	props<<luxrays::Property("film.outputs.1.type")("RGBA");
-	props<<luxrays::Property("film.outputs.1.filename")("output.exr"); // We don't actually save the image, but we still need to specify a format
-	props<<luxrays::Property("film.outputs.2.type")("ALBEDO");
-	props<<luxrays::Property("film.outputs.2.filename")("albedo.exr");
-	props<<luxrays::Property("film.outputs.3.type")("SHADING_NORMAL");
-	props<<luxrays::Property("film.outputs.3.filename")("normal.exr");
+
+	props<<luxrays::Property("film.opencl.enable")("0"); // TODO: If enabled, causes a crash in ExecuteImagePipeline, reason unknown
+	props<<luxrays::Property("film.opencl.platform")("-1");
+	props<<luxrays::Property("film.opencl.device")("-1");
+
+	if(m_enablePhotonGiCache)
+	{
+		// See https://forums.luxcorerender.org/viewtopic.php?t=840
+		props<<luxrays::Property("path.photongi.sampler.type")("METROPOLIS");
+
+		props<<luxrays::Property("path.photongi.visibility.enabled")("1");
+		props<<luxrays::Property("path.photongi.visibility.targethitrate")("0.99");
+		props<<luxrays::Property("path.photongi.visibility.maxsamplecount")("1048576");
+
+		props<<luxrays::Property("path.photongi.direct.enabled")("1");
+		props<<luxrays::Property("path.photongi.indirect.enabled")("1");
+		props<<luxrays::Property("path.photongi.caustic.enabled")("1");
+		
+		props<<luxrays::Property("path.photongi.photon.maxcount")("100000");
+		props<<luxrays::Property("path.photongi.photon.maxdepth")("4");
+		props<<luxrays::Property("path.photongi.direct.maxsize")("100000");
+		props<<luxrays::Property("path.photongi.indirect.maxsize")("100000");
+		props<<luxrays::Property("path.photongi.caustic.maxsize")("100000");
+		props<<luxrays::Property("path.photongi.lookup.maxcount")("48");
+		props<<luxrays::Property("path.photongi.photon.maxdepth")("4");
+		props<<luxrays::Property("path.photongi.lookup.radius")("0.15");
+		props<<luxrays::Property("path.photongi.lookup.normalangle")("10.0");
+		props<<luxrays::Property("path.photongi.debug.type")("none"); // Possible values: showdirect, showindirect, showcaustic, none
+	}
+
+	if(m_enableLightSamplingCache)
+		props<<luxrays::Property("lightstrategy.type")("DLS_CACHE");
+
+	props<<luxrays::Property("film.opencl.device")("-1");
+
+	auto enableColorOutput = (renderMode == unirender::Scene::RenderMode::BakeDiffuseLighting) ||
+		(renderMode == unirender::Scene::RenderMode::RenderImage);
+	auto enableAlbedoOutput = (renderMode == unirender::Scene::RenderMode::SceneAlbedo) ||
+		((enableColorOutput || renderMode == unirender::Scene::RenderMode::BakeDiffuseLighting) && m_scene->ShouldDenoise());
+	auto enableNormalOutput = (renderMode == unirender::Scene::RenderMode::SceneNormals) ||
+		((enableColorOutput || renderMode == unirender::Scene::RenderMode::BakeDiffuseLighting) && m_scene->ShouldDenoise());
+	if(renderMode == unirender::Scene::RenderMode::BakeDiffuseLighting)
+	{
+		// Don't need these for denoising lightmaps
+		enableAlbedoOutput = false;
+		enableNormalOutput = false;
+	}
+	if(enableColorOutput)
+	{
+		auto colorOutput = AddOutput(OUTPUT_COLOR);
+		std::string propName = "film.outputs." +std::to_string(colorOutput.first);
+		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(Scene::RenderMode::RenderImage)));
+		props<<luxrays::Property(propName +".filename")("output.exr"); // We don't actually save the image, but we still need to specify a format
+		props<<luxrays::Property(propName +".filesafe")("0");
+		props<<luxrays::Property(propName +".index")("0");
+	}
+
+		/*props<<luxrays::Property("film.imagepipelines.0.0.type")("INTEL_OIDN");
+		props<<luxrays::Property("film.imagepipelines.0.0.sharpness")("0.0");
+		if(bakeLightmaps)
+			props<<luxrays::Property("film.imagepipelines.0.0.filter.type")("RTLightmap");
+		else
+			props<<luxrays::Property("film.imagepipelines.0.0.filter.type")("RT");*/
+	if(enableAlbedoOutput)
+	{
+		auto albedoOutput = AddOutput(OUTPUT_ALBEDO);
+		std::string propName = "film.outputs." +std::to_string(albedoOutput.first);
+		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(Scene::RenderMode::SceneAlbedo)));
+		props<<luxrays::Property(propName +".filename")("albedo.exr");
+		props<<luxrays::Property(propName +".filesafe")("0");
+	}
+	if(enableNormalOutput)
+	{
+		auto normalOutput = AddOutput(OUTPUT_NORMAL);
+		std::string propName = "film.outputs." +std::to_string(normalOutput.first);
+		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(Scene::RenderMode::SceneNormals)));
+		props<<luxrays::Property(propName +".filename")("normal.exr");
+		props<<luxrays::Property(propName +".filesafe")("0");
+	}
+	if(
+		renderMode != unirender::Scene::RenderMode::RenderImage &&
+		renderMode != unirender::Scene::RenderMode::BakeAmbientOcclusion &&
+		renderMode != unirender::Scene::RenderMode::BakeNormals &&
+		renderMode != unirender::Scene::RenderMode::BakeDiffuseLighting &&
+		renderMode != unirender::Scene::RenderMode::SceneAlbedo &&
+		renderMode != unirender::Scene::RenderMode::SceneNormals
+	)
+	{
+		auto output = AddOutput(GetOutputType(renderMode));
+		std::string propName = "film.outputs." +std::to_string(output.first);
+		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(renderMode)));
+		props<<luxrays::Property(propName +".filename")(TranslateOutputTypeToLuxCoreRender(GetOutputType(renderMode)) +".exr");
+		props<<luxrays::Property(propName +".filesafe")("0");
+	}
+	if(ShouldUseTransparentSky())
+	{
+		props<<luxrays::Property("path.forceblackbackground.enable")(true);
+
+		auto alphaOutput = AddOutput(OUTPUT_ALPHA);
+		std::string propName = "film.outputs." +std::to_string(alphaOutput.first);
+		props<<luxrays::Property(propName +".type")(alphaOutput.second);
+		props<<luxrays::Property(propName +".filename")("alpha.exr");
+		props<<luxrays::Property(propName +".filesafe")("0");
+	}
+	if(bakeLightmaps && m_bakeObjectNames.empty() == false)
+	{
+		FileManager::CreatePath((util::Path::CreateFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME).GetPath()).c_str());
+		props<<luxrays::Property("film.outputs.0.type")("RGBA");
+		props<<luxrays::Property("film.outputs.0.filename")("RGBA_0.exr");
+		props<<luxrays::Property("film.outputs.0.index")("0");
+		props<<luxrays::Property("film.imagepipelines.0.0.type")("NOP");
+		props<<luxrays::Property("film.imagepipelines.0.0.type")("TONEMAP_LINEAR");
+		props<<luxrays::Property("film.imagepipelines.0.0.scale")("1");
+		/*props<<luxrays::Property("film.imagepipelines.0.0.type")("NOP");
+		props<<luxrays::Property("film.imagepipelines.0.1.type")("TONEMAP_LINEAR");
+		props<<luxrays::Property("film.imagepipelines.0.1.scale")("1");
+		props<<luxrays::Property("film.imagepipelines.0.2.type")("GAMMA_CORRECTION");
+		props<<luxrays::Property("film.imagepipelines.0.2.value")("2.2000000000000002");
+		props<<luxrays::Property("film.imagepipelines.1.0.type")("NOP");*/
+
+		props<<luxrays::Property("bake.minmapautosize")(256);
+		props<<luxrays::Property("bake.maxmapautosize")(512);
+		props<<luxrays::Property("bake.powerof2autosize.enable")(0);
+		
+		props<<luxrays::Property("bake.maps.0.type")("LIGHTMAP");
+		props<<luxrays::Property("bake.maps.0.filename")(LIGHTMAP_ATLAS_OUTPUT_FILENAME);
+		props<<luxrays::Property("bake.maps.0.imagepipelineindex")(0);
+		props<<luxrays::Property("bake.maps.0.autosize.enabled")(0);
+		props<<luxrays::Property("bake.maps.0.uvindex")(LIGHTMAP_UV_CHANNEL);
+		props<<luxrays::Property("bake.maps.0.width")(resolution.x);
+		props<<luxrays::Property("bake.maps.0.height")(resolution.y);
+		//props<<luxrays::Property("bake.maps.0.objectnames")("1398588469529680");
+		
+		props<<to_luxcore_list("bake.maps.0.objectnames",m_bakeObjectNames);
+		
+		props<<luxrays::Property("film.filter.type")("BLACKMANHARRIS");
+		props<<luxrays::Property("film.filter.width")(4);
+		props<<luxrays::Property("batch.haltnoisethreshold")(0.03);
+	}
 	//props<<luxrays::Property("film.outputs.1.type")("RGB_IMAGEPIPELINE");
 	//props<<luxrays::Property("film.outputs.1.filename")("image.png"); // We don't actually save the image, but we still need to specify a format
 	if(createInfo.samples.has_value())
@@ -925,8 +1827,11 @@ bool Renderer::Initialize()
 		props<<luxrays::Property("batch.haltspp")(*createInfo.samples);
 		props<<luxrays::Property("film.spp")(*createInfo.samples);
 	}
-	props<<luxrays::Property("film.width")(resolution.x);
-	props<<luxrays::Property("film.height")(resolution.y);
+	//if(bakeLightmaps == false)
+	{
+		props<<luxrays::Property("film.width")(resolution.x);
+		props<<luxrays::Property("film.height")(resolution.y);
+	}
 	std::unique_ptr<luxcore::RenderConfig> lcConfig {luxcore::RenderConfig::Create(
 		props,
 		m_lxScene.get()
@@ -938,6 +1843,13 @@ bool Renderer::Initialize()
 
 	m_lxConfig = std::move(lcConfig);
 	m_lxSession = std::move(lcSession);
+
+	static auto finalizeLightmap = false;
+	if(finalizeLightmap)
+	{
+		auto result = FinalizeLightmap("temp/lightmap_atlas.exr","render/lightmaps/lightmap.dds");
+		std::cout<<"Result: "<<result<<std::endl;
+	}
 
 	// Stop the rendering
 	
@@ -975,16 +1887,18 @@ void Renderer::SyncCamera(const unirender::Camera &cam)
 	}
 	
 	auto &pose = cam.GetPose();
-	auto &pos = pose.GetOrigin();
-	auto up = uquat::up(pose.GetRotation());
-	auto target = pos +uquat::forward(pose.GetRotation()) *100.f;
+	auto pos = ToLuxPosition(pose.GetOrigin());
+	auto up = ToLuxNormal(uquat::up(pose.GetRotation()));
+	auto n = ToLuxNormal(uquat::forward(pose.GetRotation()));
+	auto target = pos +to_luxcore_vector(n) *100.f;
+	auto fov = umath::rad_to_deg(umath::vertical_fov_to_horizontal_fov(umath::deg_to_rad(cam.GetFov()),cam.GetWidth(),cam.GetHeight()));
 	std::string propName = "scene.camera";
 	m_lxScene->Parse(
 		luxrays::Property(propName +".type")(lcCamType)<<
 		luxrays::Property(propName +".lookat.orig")(pos.x,pos.y,pos.z)<<
 		luxrays::Property(propName +".lookat.target")(target.x,target.y,target.z)<<
 		luxrays::Property(propName +".up")(up.x,up.y,up.z)<<
-		luxrays::Property(propName +".fieldofview")(cam.GetFov())
+		luxrays::Property(propName +".fieldofview")(fov)
 		// luxrays::Property(propName +".screenwindow")(0.0,1.0,0.0,1.0)
 		// luxrays::Property(propName +".shutteropen")(0.0)<<
 		// luxrays::Property(propName +".shutterclose")(0.0)<<
@@ -995,14 +1909,16 @@ void Renderer::SyncCamera(const unirender::Camera &cam)
 
 void Renderer::SyncFilm(const unirender::Camera &cam)
 {
+	auto renderMode = m_scene->GetRenderMode();
+	auto bakeLightmaps = (renderMode == unirender::Scene::RenderMode::BakeDiffuseLighting);
+	if(bakeLightmaps)
+		return;
 	std::string propName = "film";
 	m_lxScene->Parse(
 		luxrays::Property(propName +".width")(cam.GetWidth())<<
 		luxrays::Property(propName +".height")(cam.GetHeight())
 	);
 }
-
-static luxrays::Matrix4x4 to_luxcore_matrix(const umath::ScaledTransform &t) {return to_luxcore_matrix(t.ToMatrix());}
 
 void Renderer::SyncObject(const unirender::Object &obj)
 {
@@ -1014,21 +1930,18 @@ void Renderer::SyncObject(const unirender::Object &obj)
 	// Shaders
 	auto &luxNodeManager = get_lux_node_manager();
 	auto &shaders = mesh.GetSubMeshShaders();
+	auto isLightmapMesh = (m_lightmapMeshes.find(&mesh) != m_lightmapMeshes.end());
 	for(auto i=decltype(shaders.size()){0u};i<shaders.size();++i)
 	{
 		std::string matName;
 		auto desc = shaders.at(i)->GetActivePassNode();
 		if(desc == nullptr)
 			desc = GroupNodeDesc::Create(m_scene->GetShaderNodeManager()); // Just create a dummy node
+
+		desc->ResolveGroupNodes();
 		auto &nodes = desc->GetChildNodes();
 
-		LuxNodeCache nodeCache {static_cast<uint32_t>(nodes.size())};
-		for(auto i=decltype(nodes.size()){0u};i<nodes.size();++i)
-		{
-			auto &node = nodes[i];
-			auto name = "node_" +node->GetName() +std::to_string(m_shaderNodeIdx++);
-			nodeCache.SetNodeName(i,name);
-		}
+		LuxNodeCache nodeCache {static_cast<uint32_t>(nodes.size()),m_shaderNodeIdx};
 		for(auto &node : nodes)
 		{
 			if(node->GetOutputs().empty() == false)
@@ -1037,7 +1950,8 @@ void Renderer::SyncObject(const unirender::Object &obj)
 			auto *factory = luxNodeManager.GetFactory(type);
 			if(factory)
 			{
-				auto properties = (*factory)(*m_lxScene,*desc,*node,nodeCache);
+				unirender::Socket sock {*node,"in",true /* output */};
+				auto properties = (*factory)(*this,*desc,*node,sock,nodeCache);
 				if(properties.has_value())
 				{
 					auto &names = properties->GetAllNames();
@@ -1082,13 +1996,40 @@ void Renderer::SyncObject(const unirender::Object &obj)
 		auto objName = GetName(obj,i);
 		std::string propName = "scene.objects." +objName;
 		auto shapeName = GetName(obj.GetMesh(),i);
-		m_lxScene->Parse(
-			luxrays::Property(propName +".material")(matName)<<
-			luxrays::Property(propName +".shape")(shapeName)
-			//luxrays::Property(propName +".transformation")(to_luxcore_matrix(obj.GetPose()))
-			// luxrays::Property(propName +".id")("")<<
-			// luxrays::Property(propName +".camerainvisible")(false)
-		);
+
+		luxrays::Properties props = luxrays::Property(propName +".material")(matName)<<
+			luxrays::Property(propName +".shape")(shapeName)<<
+			to_luxcore_matrix(propName +".transformation",obj.GetPose());
+		// luxrays::Property(propName +".id")("")<<
+		// luxrays::Property(propName +".camerainvisible")(false)
+
+		if(isLightmapMesh)
+		{
+			//props<<luxrays::Property(propName +".bake.lightmap.file")("E:/projects/pragma/build_winx64/install/luxcore_lightmap.png")<<
+			//luxrays::Property(propName +".bake.lightmap.gamma")(2.2)<<
+			//luxrays::Property(propName +".bake.lightmap.storage")("auto")<<
+			//luxrays::Property(propName +".bake.lightmap.wrap")("repeat")<<
+			// luxrays::Property(propName +".bake.lightmap.channel")(matName)<<
+			//luxrays::Property(propName +".bake.lightmap.uvindex")(LIGHTMAP_UV_CHANNEL);
+			m_bakeObjectNames.push_back(objName);
+		}
+
+		m_lxScene->Parse(props);
+
+#if 0
+	if(o == nullptr)
+		return;
+	auto objName = GetName(*o,0);
+	std::string propName = "scene.objects." +objName;
+	m_lxScene->Parse(
+		luxrays::Property(propName +".bake.lightmap.file")("luxcore_lightmap.png")<<
+		//luxrays::Property(propName +".bake.lightmap.gamma")(2.2)<<
+		//luxrays::Property(propName +".bake.lightmap.storage")("auto")<<
+		//luxrays::Property(propName +".bake.lightmap.wrap")("repeat")<<
+		// luxrays::Property(propName +".bake.lightmap.channel")(matName)<<
+		luxrays::Property(propName +".bake.lightmap.uvindex")(0)
+	);
+#endif
 
 		auto &hairConfig = shaders.at(i)->GetHairConfig();
 		if(hairConfig.has_value() == false)
@@ -1096,7 +2037,8 @@ void Renderer::SyncObject(const unirender::Object &obj)
 		propName = "scene.objects." +objName +"_strands";
 		m_lxScene->Parse(
 			luxrays::Property(propName +".material")(matName)<<
-			luxrays::Property(propName +".shape")(shapeName +"_strands")
+			luxrays::Property(propName +".shape")(shapeName +"_strands")<<
+			to_luxcore_matrix(propName +".transformation",obj.GetPose())
 		);
 	}
 
@@ -1128,51 +2070,61 @@ void Renderer::SyncLight(const unirender::Light &light)
 	//watt *= lightIntensityFactor;
 
 	watt *= m_scene->GetLightIntensityFactor();
-	watt *= ulighting::MAX_LIGHT_EFFICIENCY_EFFICACY;
 
+	auto convFactor = 0.07; // Conversion to match Cycles light intensity (subjective); See https://github.com/LuxCoreRender/BlendLuxCore/blob/43852c608d617afff842f9a43daaff9862777927/export/light.py
+	watt *= convFactor;
+
+	auto gain = watt;
+	float envLightFactor = 0.01f;
+	if(light.GetType() == unirender::Light::Type::Directional)
+		gain *= envLightFactor;
+	else
+	{
+		static auto gainMul = 1.f;
+		gain *= gainMul;
+	}
 
 	luxrays::Properties props {};
-	props<<luxrays::Property{propName +".gain"}(color.r,color.g,color.b);
+	props<<luxrays::Property{propName +".color"}(color.r,color.g,color.b);
+	props<<luxrays::Property{propName +".gain"}(gain,gain,gain);
+	props<<luxrays::Property(propName +".power")(0.0);
+	props<<luxrays::Property(propName +".efficency")(0.0);
+	props<<luxrays::Property(propName +".normalizebycolor")(false);
 	switch(light.GetType())
 	{
 	case unirender::Light::Type::Spot:
 	{
-		auto &pos = light.GetPose().GetOrigin();
-		auto target = pos +uquat::forward(light.GetPose().GetRotation()) *100.f;
-		auto outerConeAngle = light.GetOuterConeAngle() /2.f;
-		auto innerConeAngle = umath::min(light.GetInnerConeAngle() /2.f,outerConeAngle);
+		auto pos = ToLuxPosition(light.GetPose().GetOrigin());
+		auto forward = ToLuxNormal(uquat::forward(light.GetPose().GetRotation()));
+		auto target = pos +to_luxcore_vector(forward) *100.f;
 		props<<luxrays::Property(propName +".type")("spot");
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
 		props<<luxrays::Property(propName +".target")(target.x,target.y,target.z);
-		props<<luxrays::Property(propName +".power")(watt);
-		props<<luxrays::Property(propName +".efficency")(ulighting::MAX_LIGHT_EFFICIENCY_EFFICACY);
 		props<<luxrays::Property(propName +".coneangle")(light.GetOuterConeAngle());
-		props<<luxrays::Property(propName +".conedeltaangle")(outerConeAngle -innerConeAngle);
+		props<<luxrays::Property(propName +".conedeltaangle")(light.GetInnerConeAngle());
 		break;
 	}
 	case unirender::Light::Type::Point:
 	{
-		auto &pos = light.GetPose().GetOrigin();
-		auto dir = uquat::forward(light.GetPose().GetRotation());
+		auto pos = ToLuxPosition(light.GetPose().GetOrigin());
+		auto dir = ToLuxNormal(uquat::forward(light.GetPose().GetRotation()));
 		props<<luxrays::Property(propName +".type")("sphere");
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
 		props<<luxrays::Property(propName +".turbidity")(2.2);
 		props<<luxrays::Property(propName +".relsize")(1.0);
 		props<<luxrays::Property(propName +".dir")(dir.x,dir.y,dir.z);
-		props<<luxrays::Property(propName +".power")(watt);
-		props<<luxrays::Property(propName +".efficency")(ulighting::MAX_LIGHT_EFFICIENCY_EFFICACY);
 		break;
 	}
 	case unirender::Light::Type::Directional:
 	{
-		auto &pos = light.GetPose().GetOrigin();
-		auto target = pos +uquat::forward(light.GetPose().GetRotation()) *100.f;
+		auto pos = ToLuxPosition(light.GetPose().GetOrigin());
+		auto dir = ToLuxNormal(uquat::forward(light.GetPose().GetRotation()));
+		auto target = pos +to_luxcore_vector(dir) *100.f;
 		auto outerConeAngle = light.GetOuterConeAngle();
 		auto innerConeAngle = umath::min(light.GetInnerConeAngle(),outerConeAngle);
 		props<<luxrays::Property(propName +".type")("sun");
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
-		props<<luxrays::Property(propName +".power")(0.0);
-		props<<luxrays::Property(propName +".efficency")(0.0);
+		props<<luxrays::Property(propName +".dir")(dir.x,dir.y,dir.z);
 		break;
 	}
 	}
@@ -1223,6 +2175,7 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 	auto &verts = mesh.GetVertices();
 	auto &uvs = mesh.GetPerVertexUvs();
 	auto &normals = mesh.GetVertexNormals();
+	auto &lightmapUvs = mesh.GetLightmapUvs();
 	for(auto iShader=decltype(meshInstancePerShader.size()){0u};iShader!=meshInstancePerShader.size();++iShader)
 	{
 		auto &meshInstance = meshInstancePerShader[iShader];
@@ -1260,20 +2213,51 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 
 			auto &v = verts[idx];
 			static_assert(sizeof(v) == sizeof(luxrays::Point));
-			points[i] = *reinterpret_cast<const luxrays::Point*>(&v);
+			points[i] = ToLuxPosition(v);
 
 			auto &uv = uvs[idx];
 			static_assert(sizeof(uv) == sizeof(luxrays::UV));
-			lxUvs[i] = *reinterpret_cast<const luxrays::UV*>(&uv);
+			lxUvs[i] = ToLuxUV(uv);
 
 			auto &n = normals[idx];
 			static_assert(sizeof(n) == sizeof(luxrays::Normal));
-			lxNormals[i] = *reinterpret_cast<const luxrays::Normal*>(&n);
+			lxNormals[i] = ToLuxNormal(n);
 		}
 
-		auto name = GetName(mesh,iShader);
-		m_lxScene->DefineMesh(name,numMeshVerts,numMeshTris,reinterpret_cast<float*>(points),reinterpret_cast<unsigned int*>(lxTris),reinterpret_cast<float*>(lxNormals),reinterpret_cast<float*>(lxUvs),nullptr,nullptr);
+		luxrays::UV *lxLightmapUvs = nullptr;
+		if(lightmapUvs.empty() == false)
+		{
+			lxLightmapUvs = new luxrays::UV[numMeshVerts]; // Note: Will be freed by luxcore
+			for(auto i=decltype(numMeshVerts){0u};i<numMeshVerts;++i)
+			{
+				auto idx = meshVertIndices[i];
+				auto &uv = lightmapUvs[idx];
+				static_assert(sizeof(uv) == sizeof(luxrays::UV));
+				lxLightmapUvs[i] = *reinterpret_cast<const luxrays::UV*>(&uv);
+			}
+		}
 
+		
+		std::array<float*,8> lxUvChannels {
+			reinterpret_cast<float*>(lxUvs)
+		};
+		if(lxLightmapUvs)
+		{
+			lxUvChannels[LIGHTMAP_UV_CHANNEL] = reinterpret_cast<float*>(lxLightmapUvs);
+			m_lightmapMeshes.insert(&mesh);
+		}
+		auto enableSubdivision = m_enableMeshSubdivision;
+		auto name = GetName(mesh,iShader);
+		if(enableSubdivision)
+			name += "_base";
+		m_lxScene->DefineMeshExt(name,numMeshVerts,numMeshTris,reinterpret_cast<float*>(points),reinterpret_cast<unsigned int*>(lxTris),reinterpret_cast<float*>(lxNormals),&lxUvChannels,nullptr,nullptr);
+		if(enableSubdivision)
+		{
+			luxrays::Properties props {};
+			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".type")("subdiv");
+			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".source")(name);
+			m_lxScene->Parse(props);
+		}
 		auto &shader = mesh.GetSubMeshShaders()[iShader];
 		auto &hairConfig = shader->GetHairConfig();
 		if(hairConfig.has_value() == false)
@@ -1498,7 +2482,10 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 }
 
 void Renderer::SetCancelled(const std::string &msg)
-{}
+{
+	m_lxSession->Stop();
+	m_tileManager.Cancel();
+}
 void Renderer::PrepareCyclesSceneForRendering()
 {
 	unirender::Renderer::PrepareCyclesSceneForRendering();
