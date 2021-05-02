@@ -40,7 +40,7 @@ namespace unirender::luxcorerender
 			Bake // For internal use only!
 		};
 
-		static std::shared_ptr<Renderer> Create(const unirender::Scene &scene);
+		static std::shared_ptr<Renderer> Create(const unirender::Scene &scene,Flags flags);
 		static std::shared_ptr<Renderer> CreateResume();
 		static std::string TranslateOutputTypeToLuxCoreRender(const std::string &type);
 		static constexpr uint32_t LIGHTMAP_UV_CHANNEL = 1;
@@ -82,6 +82,7 @@ namespace unirender::luxcorerender
 
 		luxcore::Scene &GetLuxScene() {return *m_lxScene;}
 		bool ShouldUsePhotonGiCache() const {return m_enablePhotonGiCache;}
+		bool ShouldUseHairShader() const {return m_useHairShader;}
 
 		virtual ~Renderer() override;
 		virtual void Wait() override;
@@ -93,12 +94,15 @@ namespace unirender::luxcorerender
 		virtual bool Pause() override;
 		virtual bool Resume() override;
 		virtual bool Suspend() override;
+		virtual bool BeginSceneEdit() const override;
+		virtual bool EndSceneEdit() const override;
 		virtual bool Export(const std::string &path) override;
 		virtual std::optional<std::string> SaveRenderPreview(const std::string &path,std::string &outErr) const override;
 		virtual util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> StartRender() override;
 	private:
 		Renderer(const Scene &scene);
 		void StopRenderSession();
+		void UpdateProgressiveRender();
 		static std::string GetName(const BaseObject &obj);
 		static std::string GetName(const Object &obj,uint32_t shaderIdx);
 		static std::string GetName(const Mesh &mesh,uint32_t shaderIdx);
@@ -111,7 +115,7 @@ namespace unirender::luxcorerender
 		virtual void CloseRenderScene() override;
 		virtual void FinalizeImage(uimg::ImageBuffer &imgBuf,StereoEye eyeStage);
 		
-		bool Initialize();
+		bool Initialize(Flags flags);
 		void SyncCamera(const unirender::Camera &cam);
 		void SyncFilm(const unirender::Camera &cam);
 		void SyncObject(const unirender::Object &obj);
@@ -120,6 +124,7 @@ namespace unirender::luxcorerender
 		virtual void SetCancelled(const std::string &msg="Cancelled by application.") override;
 		virtual void PrepareCyclesSceneForRendering() override;
 
+		Flags m_flags = Flags::None;
 		std::vector<std::string> m_bakeObjectNames {};
 		std::unordered_set<const unirender::Mesh*> m_lightmapMeshes {};
 		unirender::Object *m_bakeTarget = nullptr;
@@ -128,6 +133,7 @@ namespace unirender::luxcorerender
 		std::unique_ptr<luxcore::Scene> m_lxScene = nullptr;
 		std::unique_ptr<luxcore::RenderConfig> m_lxConfig = nullptr;
 		std::unique_ptr<luxcore::RenderSession> m_lxSession = nullptr;
+		bool m_useHairShader = false;
 		
 		RenderEngine m_renderEngine = RenderEngine::PathTracer;
 		bool m_enablePhotonGiCache = false;

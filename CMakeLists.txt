@@ -142,6 +142,7 @@ add_external_library(luxcorerender_tbb)
 add_def(OIIO_STATIC_BUILD)
 add_def(GLEW_STATIC)
 add_def(RTUTIL_DLL)
+add_def(UIMG_ENABLE_NVTT)
 
 ##### CONFIGURATION #####
 

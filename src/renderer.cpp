@@ -34,14 +34,29 @@
 using namespace unirender::luxcorerender;
 #pragma optimize("",off)
 
-#include <util_raytracing/hair.hpp>
+#include <sharedutils/util_hair.hpp>
 static Vector3 calc_hair_normal(const Vector3 &flowNormal,const Vector3 &faceNormal)
 {
 	auto hairNormal = flowNormal -uvec::project(flowNormal,faceNormal);
-	uvec::normalize(&hairNormal);
+	auto l = uvec::length(hairNormal);
+	if(l > 0.001f)
+		hairNormal /= l;
+	else
+		hairNormal = faceNormal;
 	return hairNormal;
 }
-static std::unique_ptr<luxrays::cyHairFile> generate_hair_file(const unirender::HairConfig &hairConfig,const unirender::HairGenerator::HairData &hairData)
+
+static Vector3 apply_curvature(const Vector3 &baseHairDir,const Vector3 &surfaceTargetNormal,float curvature,float factor)
+{
+	if(uvec::distance(baseHairDir,surfaceTargetNormal) < 0.001f)
+		return baseHairDir;
+	auto f = factor *curvature;
+	auto n = glm::slerp(baseHairDir,surfaceTargetNormal,f);
+	uvec::normalize(&n); // Probably not needed
+	return n;
+}
+
+static std::unique_ptr<luxrays::cyHairFile> generate_hair_file(const util::HairConfig &hairConfig,const util::HairData &hairData)
 {
 	auto numHair = hairData.hairPoints.size();
 	auto numSegments = hairConfig.numSegments;
@@ -76,10 +91,12 @@ static std::unique_ptr<luxrays::cyHairFile> generate_hair_file(const unirender::
 		auto randomHairLengthFactor = hairConfig.randomHairLengthFactor;
 		auto thickness = hairConfig.defaultThickness;
 
-		const Vector3 gravity {0.f,-1.f,0.f};
+		Vector3 gravity {0.f,-1.f,0.f};
+		auto lxGravity = Renderer::ToLuxPosition(gravity);
+		gravity = {lxGravity.x,lxGravity.y,lxGravity.z};
 		const Vector3 flowNormal = gravity;
-		auto hairNormal = calc_hair_normal(flowNormal,faceNormal);
-		hairNormal = faceNormal *hairStrength +(1.f -hairStrength) *hairNormal;
+		auto baseHairNormal = calc_hair_normal(flowNormal,faceNormal);
+		auto hairNormal = faceNormal *hairStrength +(1.f -hairStrength) *baseHairNormal;
 		uvec::normalize(&hairNormal);
 
 		//hairPoints.push_back(p);
@@ -87,13 +104,17 @@ static std::unique_ptr<luxrays::cyHairFile> generate_hair_file(const unirender::
 		auto hairLength = length *(1.f -randomHairLengthFactor) +length *randomHairLengthFactor *umath::random(0.f,1.f);
 
 		fAddHairPoint(p,uv,thickness);
+		auto lenPerSegment = hairLength /static_cast<float>(numSegments);
+		auto p0 = p;
 		for(auto j=decltype(numSegments){0u};j<numSegments;++j)
 		{
 			auto f = (j +1) /static_cast<float>(numSegments);
+
+			auto n = apply_curvature(hairNormal,baseHairNormal,hairConfig.curvature,f);
 			//auto p0 = (j > 0) ? hairPoints.back() : p;
-			auto p1 = p +hairNormal *f *hairLength;
-			// TODO: Apply modifier to p1
+			auto p1 = p0 +n *lenPerSegment;
 			fAddHairPoint(p1,uv,(1.f -f) *thickness);
+			p0 = p1;
 		}
 	}
 	return hairFile;
@@ -604,7 +625,8 @@ void LuxNodeManager::Initialize()
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SHEEN,propName +".sheen",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SHEEN_TINT,propName +".sheentint",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_EMISSION,propName +".emission",false);
-		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_NORMAL,propName +".normaltex",false,false,true);
+		if(renderer.ShouldUseHairShader() == false) // Normal map causes hair to be black for some reason
+			ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_NORMAL,propName +".normaltex",false,false,true);
 		if(renderer.ShouldUsePhotonGiCache())
 			props<<luxrays::Property(propName +".photongi.enable")("1");
 		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_IOR,propName +".volume.interiorior",false);
@@ -806,9 +828,9 @@ void LuxNodeManager::Initialize()
 ////////////
 
 extern "C" {
-	std::shared_ptr<unirender::Renderer> __declspec(dllexport) create_renderer(const unirender::Scene &scene)
+	std::shared_ptr<unirender::Renderer> __declspec(dllexport) create_renderer(const unirender::Scene &scene,unirender::Renderer::Flags flags)
 	{
-		return Renderer::Create(scene);
+		return Renderer::Create(scene,flags);
 	}
 };
 
@@ -883,10 +905,10 @@ float Renderer::ToLuxLength(float len)
 #endif
 }
 
-std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene)
+std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene,Flags flags)
 {
 	auto renderer = std::shared_ptr<Renderer>{new Renderer{scene}};
-	if(renderer->Initialize() == false)
+	if(renderer->Initialize(flags) == false)
 		return nullptr;
 	return renderer;
 }
@@ -1189,6 +1211,66 @@ bool Renderer::Suspend()
 	m_lxSession->SaveResumeFile(path.GetString());
 	return true;
 }
+void Renderer::UpdateProgressiveRender()
+{
+	constexpr auto useFloatFormat = true;
+	auto &scene = GetScene();
+	auto resolution = scene.GetResolution();
+	TileManager::TileData tileData {};
+	tileData.x = 0;
+	tileData.y = 0;
+	tileData.w = resolution.x;
+	tileData.h = resolution.y;
+	tileData.index = 0;
+
+	std::shared_ptr<uimg::ImageBuffer> imgBuf = nullptr;
+	if(useFloatFormat)
+	{
+		tileData.flags |= TileManager::TileData::Flags::Initialized;
+		auto format = uimg::ImageBuffer::Format::RGBA32;
+		tileData.data.resize(resolution.x *resolution.y *uimg::ImageBuffer::GetPixelSize(format));
+		imgBuf = uimg::ImageBuffer::Create(tileData.data.data(),resolution.x,resolution.y,format);
+	}
+	else
+	{
+		tileData.flags |= TileManager::TileData::Flags::HDRData | TileManager::TileData::Flags::Initialized;
+		tileData.data.resize(resolution.x *resolution.y *uimg::ImageBuffer::GetPixelSize(uimg::ImageBuffer::Format::RGBA16));
+		imgBuf = uimg::ImageBuffer::Create(resolution.x,resolution.y,uimg::ImageBuffer::Format::RGBA32);
+	}
+	m_lxSession->GetFilm().GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_RGBA,reinterpret_cast<float*>(imgBuf->GetData()));
+	imgBuf->FlipVertically();
+
+	// Denoising is too slow for real-time use
+	/*DenoiseInfo denoiseInfo {};
+	denoiseInfo.width = imgBuf->GetWidth();
+	denoiseInfo.height = imgBuf->GetHeight();
+	denoiseInfo.hdr = true;
+	denoise(denoiseInfo,*imgBuf);*/
+
+	if(!useFloatFormat)
+	{
+		auto imgBufDst = uimg::ImageBuffer::Create(tileData.data.data(),resolution.x,resolution.y,uimg::ImageBuffer::Format::RGBA16);
+		imgBuf->Convert(*imgBufDst);
+	}
+
+	const_cast<Renderer*>(this)->m_tileManager.ApplyPostProcessingForProgressiveTile(tileData);
+	const_cast<Renderer*>(this)->m_tileManager.AddRenderedTile(std::move(tileData));
+}
+bool Renderer::BeginSceneEdit() const
+{
+	if(!umath::is_flag_set(m_flags,Flags::EnableLiveEditing))
+		return false;
+	m_lxSession->BeginSceneEdit();
+	return true;
+}
+bool Renderer::EndSceneEdit() const
+{
+	if(!umath::is_flag_set(m_flags,Flags::EnableLiveEditing))
+		return false;
+	const_cast<Renderer*>(this)->SyncCamera(m_scene->GetCamera());
+	m_lxSession->EndSceneEdit();
+	return true;
+}
 bool Renderer::Export(const std::string &strPath)
 {
 	FileManager::CreatePath(strPath.c_str());
@@ -1251,12 +1333,20 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 				if(m_lxSession->IsInPause())
 					continue;
+				UpdateProgressiveRender();
 				m_lxSession->UpdateStats();
 				const double elapsedTime = stats.Get("stats.renderengine.time").Get<double>();
 				const unsigned int pass = stats.Get("stats.renderengine.pass").Get<unsigned int>();
 				const float convergence = stats.Get("stats.renderengine.convergence").Get<unsigned int>();
 				m_progress = pass /static_cast<double>(haltSpp);
 				worker.UpdateProgress(m_progress);
+
+				static auto debugExport = false;
+				if(debugExport)
+				{
+					debugExport = false;
+					Export("render/export/");
+				}
 		
 				// Print some information about the rendering progress
 				sprintf(buf, "[Elapsed time: %3d/%dsec][Samples %4d/%d][Convergence %f%%][Avg. samples/sec % 3.2fM on %.1fK tris]",
@@ -1540,7 +1630,7 @@ util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> Renderer::StartRender()
 	return job;
 }
 
-bool Renderer::Initialize()
+bool Renderer::Initialize(Flags flags)
 {
 	PrepareCyclesSceneForRendering();
 	auto &logHandler = unirender::get_log_handler();
@@ -1562,30 +1652,33 @@ bool Renderer::Initialize()
 	{
 		auto &sceneInfo = m_scene->GetSceneInfo();
 		auto &skyTex = sceneInfo.sky;
-
-		auto mulFactor = 50.f; // Factor of 50 matches Cycles very closely, reason unknown
-		Vector3 gain {sceneInfo.skyStrength,sceneInfo.skyStrength,sceneInfo.skyStrength};
-		gain *= mulFactor;
-		float gamma = 1.0;
-		auto absPath = Scene::GetAbsSkyPath(skyTex);
-		if(absPath.has_value())
+		if(!skyTex.empty())
 		{
-			std::string propName = "scene.lights.sky";
-			umath::ScaledTransform pose {};
-			pose.SetRotation(uquat::create(sceneInfo.skyAngles));
-			pose.SetScale(Vector3{-1.f,1.f,1.f});
-			lcScene->Parse(
-				luxrays::Property(propName +".type")("infinite")<<
-				luxrays::Property(propName +".file")(*absPath)<<
-				luxrays::Property(propName +".gain")(gain.x,gain.y,gain.z)<<
-				luxrays::Property(propName +".gamma")(gamma)<<
-				to_luxcore_matrix(propName +".transformation",pose)
-			);
+			auto mulFactor = 50.f; // Factor of 50 matches Cycles very closely, reason unknown
+			Vector3 gain {sceneInfo.skyStrength,sceneInfo.skyStrength,sceneInfo.skyStrength};
+			gain *= mulFactor;
+			float gamma = 1.0;
+			auto absPath = Scene::GetAbsSkyPath(skyTex);
+			if(absPath.has_value())
+			{
+				std::string propName = "scene.lights.sky";
+				umath::ScaledTransform pose {};
+				pose.SetRotation(uquat::create(sceneInfo.skyAngles));
+				pose.SetScale(Vector3{-1.f,1.f,1.f});
+				lcScene->Parse(
+					luxrays::Property(propName +".type")("infinite")<<
+					luxrays::Property(propName +".file")(*absPath)<<
+					luxrays::Property(propName +".gain")(gain.x,gain.y,gain.z)<<
+					luxrays::Property(propName +".gamma")(gamma)<<
+					to_luxcore_matrix(propName +".transformation",pose)
+				);
+			}
 		}
 	
 	m_bakeTarget = FindObject("bake_target");
 
 	m_lxScene = std::move(lcScene);
+	SyncFilm(m_scene->GetCamera());
 	SyncCamera(m_scene->GetCamera());
 	auto &mdlCache = m_renderData.modelCache;
 	mdlCache->GenerateData();
@@ -1644,6 +1737,9 @@ bool Renderer::Initialize()
 
 	auto renderMode = m_scene->GetRenderMode();
 	std::string renderEngineType = "PATHCPU";
+	m_flags = flags;
+	if(umath::is_flag_set(flags,Flags::EnableLiveEditing))
+		m_renderEngine = RenderEngine::RealTime;
 	switch(m_renderEngine)
 	{
 	case RenderEngine::PathTracer:
@@ -1671,6 +1767,13 @@ bool Renderer::Initialize()
 	}
 	else
 		m_bakeTarget = nullptr;
+
+	if(createInfo.progressive)
+	{
+		auto tileSize = resolution;
+		m_tileManager.Initialize(resolution.x,resolution.y,tileSize.x,tileSize.y,createInfo.deviceType == unirender::Scene::DeviceType::CPU,createInfo.exposure,m_scene->GetGamma(),m_colorTransformProcessor.get());
+		m_tileManager.SetExposure(sceneInfo.exposure);
+	}
 
 	props<<luxrays::Property("renderengine.type")(renderEngineType);
 	if(renderEngineType == "TILEPATHCPU" || renderEngineType == "RTPATHOCL" || renderEngineType == "TILEPATHOCL")
@@ -1839,10 +1942,24 @@ bool Renderer::Initialize()
 	std::unique_ptr<luxcore::RenderSession> lcSession {luxcore::RenderSession::Create(lcConfig.get())};
 	if(lcSession == nullptr)
 		return false;
-	lcSession->Start();
-
 	m_lxConfig = std::move(lcConfig);
 	m_lxSession = std::move(lcSession);
+
+	static auto debugExport = false;
+	if(debugExport)
+	{
+		debugExport = false;
+		Export("render/export/");
+	}
+	try
+	{
+		m_lxSession->Start();
+	}
+	catch(const std::runtime_error &e)
+	{
+		std::cout<<"Unable to start LuxCoreRender session: "<<e.what()<<std::endl;
+		return false;
+	}
 
 	static auto finalizeLightmap = false;
 	if(finalizeLightmap)
@@ -1869,7 +1986,6 @@ Renderer::Renderer(const Scene &scene)
 
 void Renderer::SyncCamera(const unirender::Camera &cam)
 {
-	SyncFilm(cam);
 	auto &lcCam = m_lxScene->GetCamera();
 
 	std::string lcCamType = "perspective";
@@ -1934,14 +2050,20 @@ void Renderer::SyncObject(const unirender::Object &obj)
 	for(auto i=decltype(shaders.size()){0u};i<shaders.size();++i)
 	{
 		std::string matName;
+		std::string matNameHair;
 		auto desc = shaders.at(i)->GetActivePassNode();
 		if(desc == nullptr)
 			desc = GroupNodeDesc::Create(m_scene->GetShaderNodeManager()); // Just create a dummy node
 
 		desc->ResolveGroupNodes();
 		auto &nodes = desc->GetChildNodes();
-
+		
+		auto &hairConfig = shaders.at(i)->GetHairConfig();
+		auto hasHair = hairConfig.has_value();
 		LuxNodeCache nodeCache {static_cast<uint32_t>(nodes.size()),m_shaderNodeIdx};
+		std::unique_ptr<LuxNodeCache> nodeCacheHair = nullptr;
+		if(hasHair)
+			nodeCacheHair = std::make_unique<LuxNodeCache>(static_cast<uint32_t>(nodes.size()),m_shaderNodeIdx);
 		for(auto &node : nodes)
 		{
 			if(node->GetOutputs().empty() == false)
@@ -1950,24 +2072,32 @@ void Renderer::SyncObject(const unirender::Object &obj)
 			auto *factory = luxNodeManager.GetFactory(type);
 			if(factory)
 			{
-				unirender::Socket sock {*node,"in",true /* output */};
-				auto properties = (*factory)(*this,*desc,*node,sock,nodeCache);
-				if(properties.has_value())
-				{
-					auto &names = properties->GetAllNames();
-					for(auto &name : names)
+				auto fDefineShader = [&](std::string &matName,LuxNodeCache &nodeCache) {
+					unirender::Socket sock {*node,"in",true /* output */};
+					auto properties = (*factory)(*this,*desc,*node,sock,nodeCache);
+					if(properties.has_value())
 					{
-						const auto *prefix = "scene.materials.";
-						auto pos = name.find(prefix);
-						if(pos == std::string::npos)
-							continue;
-						auto sub = name.substr(pos +strlen(prefix));
-						pos = sub.find('.');
-						if(pos != std::string::npos)
-							sub = sub.substr(0,pos);
-						matName = sub;
+						auto &names = properties->GetAllNames();
+						for(auto &name : names)
+						{
+							const auto *prefix = "scene.materials.";
+							auto pos = name.find(prefix);
+							if(pos == std::string::npos)
+								continue;
+							auto sub = name.substr(pos +strlen(prefix));
+							pos = sub.find('.');
+							if(pos != std::string::npos)
+								sub = sub.substr(0,pos);
+							matName = sub;
+						}
 					}
-					//["scene.materials.node_1.type"] = {name="scene.materials.node_1.type" values={[allocator]=allocator } }
+				};
+				fDefineShader(matName,nodeCache);
+				if(hasHair)
+				{
+					m_useHairShader = true;
+					fDefineShader(matNameHair,*nodeCacheHair);
+					m_useHairShader = false;
 				}
 			}
 			else
@@ -2031,15 +2161,28 @@ void Renderer::SyncObject(const unirender::Object &obj)
 	);
 #endif
 
-		auto &hairConfig = shaders.at(i)->GetHairConfig();
-		if(hairConfig.has_value() == false)
+		if(hasHair == false)
 			continue;
 		propName = "scene.objects." +objName +"_strands";
-		m_lxScene->Parse(
-			luxrays::Property(propName +".material")(matName)<<
-			luxrays::Property(propName +".shape")(shapeName +"_strands")<<
-			to_luxcore_matrix(propName +".transformation",obj.GetPose())
-		);
+		//auto propName = "scene.materials." +nodeCache.ToLinkedSocketName(outputSocket);
+		//props<<luxrays::Property(propName +".type")("disney");
+		//ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_BASE_COLOR,propName +".basecolor",false);
+		static auto enableTransform = true;
+		if(enableTransform)
+		{
+			m_lxScene->Parse(
+				luxrays::Property(propName +".material")(matNameHair)<<
+				luxrays::Property(propName +".shape")(shapeName +"_strands")<<
+				to_luxcore_matrix(propName +".transformation",obj.GetPose())
+			);
+		}
+		else
+		{
+			m_lxScene->Parse(
+				luxrays::Property(propName +".material")(matNameHair)<<
+				luxrays::Property(propName +".shape")(shapeName +"_strands")
+			);
+		}
 	}
 
 	//std::string propName = "scene.objects." +GetName(obj);
@@ -2066,18 +2209,17 @@ void Renderer::SyncLight(const unirender::Light &light)
 		(lightType == util::pragma::LightType::Point) ? ulighting::cycles::lumen_to_watt_point(light.GetIntensity(),light.GetColor()) :
 		ulighting::cycles::lumen_to_watt_area(light.GetIntensity(),light.GetColor());
 
-	//static float lightIntensityFactor = 10.f;
-	//watt *= lightIntensityFactor;
+	static float lightIntensityFactor = 20.f;
+	watt *= lightIntensityFactor;
 
 	watt *= m_scene->GetLightIntensityFactor();
-
-	auto convFactor = 0.07; // Conversion to match Cycles light intensity (subjective); See https://github.com/LuxCoreRender/BlendLuxCore/blob/43852c608d617afff842f9a43daaff9862777927/export/light.py
-	watt *= convFactor;
 
 	auto gain = watt;
 	float envLightFactor = 0.01f;
 	if(light.GetType() == unirender::Light::Type::Directional)
 		gain *= envLightFactor;
+	else if(light.GetType() == unirender::Light::Type::Spot)
+		gain *= 0.07; // Conversion to match Cycles light intensity (subjective); See https://github.com/LuxCoreRender/BlendLuxCore/blob/43852c608d617afff842f9a43daaff9862777927/export/light.py
 	else
 	{
 		static auto gainMul = 1.f;
@@ -2262,9 +2404,9 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 		auto &hairConfig = shader->GetHairConfig();
 		if(hairConfig.has_value() == false)
 			continue;
-		unirender::HairGenerator hairGenerator {};
+		util::HairGenerator hairGenerator {};
 		struct MeshInterface
-			: public unirender::HairGenerator::MeshInterface
+			: public util::HairGenerator::MeshInterface
 		{
 			virtual uint32_t GetTriangleCount() const override {return getTriangleCount();}
 			virtual uint32_t GetVertexCount() const override {return getVertexCount();}
@@ -2299,7 +2441,7 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 		
 		auto hairData = hairGenerator.Generate(hairConfig->hairPerSquareMeter);
 		auto hairFile = generate_hair_file(*hairConfig,hairData);
-		m_lxScene->DefineStrands(name +"_strands",*hairFile,luxcore::Scene::StrandsTessellationType::TESSEL_RIBBON_ADAPTIVE,12,0.0075,12,false /* bottomCap */,false /* topCap */,true /* useCameraPosition */);
+		m_lxScene->DefineStrands(name +"_strands",*hairFile,luxcore::Scene::StrandsTessellationType::TESSEL_RIBBON_ADAPTIVE,2 /* adaptiveMaxDepth */,0.0075 /* adaptiveError */,12 /*solidSideCount */,false /* bottomCap */,false /* topCap */,true /* useCameraPosition */);
 	}
 
 #if 0
