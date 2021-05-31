@@ -32,7 +32,6 @@
 #include "tinyexr.h"
 
 using namespace unirender::luxcorerender;
-#pragma optimize("",off)
 
 #include <sharedutils/util_hair.hpp>
 static Vector3 calc_hair_normal(const Vector3 &flowNormal,const Vector3 &faceNormal)
@@ -2632,4 +2631,3 @@ void Renderer::PrepareCyclesSceneForRendering()
 {
 	unirender::Renderer::PrepareCyclesSceneForRendering();
 }
-#pragma optimize("",on)
