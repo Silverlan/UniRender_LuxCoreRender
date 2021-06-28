@@ -32,7 +32,7 @@
 #include "tinyexr.h"
 
 using namespace unirender::luxcorerender;
-
+#pragma optimize("",off)
 #include <sharedutils/util_hair.hpp>
 static Vector3 calc_hair_normal(const Vector3 &flowNormal,const Vector3 &faceNormal)
 {
@@ -231,6 +231,23 @@ unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupN
 	return find_socket_linked_to_input(rootNode,sock);
 }
 
+namespace OpenColorIO_v2_0
+{
+	const char * ROLE_DEFAULT             = "default";
+	const char * ROLE_REFERENCE           = "reference";
+	const char * ROLE_DATA                = "data";
+	const char * ROLE_COLOR_PICKING       = "color_picking";
+	const char * ROLE_SCENE_LINEAR        = "scene_linear";
+	const char * ROLE_COMPOSITING_LOG     = "compositing_log";
+	const char * ROLE_COLOR_TIMING        = "color_timing";
+	const char * ROLE_TEXTURE_PAINT       = "texture_paint";
+	const char * ROLE_MATTE_PAINT         = "matte_paint";
+	const char * ROLE_RENDERING           = "rendering";
+	const char * ROLE_INTERCHANGE_SCENE   = "aces_interchange";
+	const char * ROLE_INTERCHANGE_DISPLAY = "cie_xyz_d65_interchange";
+	const char * OCIO_VIEW_USE_DISPLAY_NAME = "<USE_DISPLAY_NAME>";
+};
+
 bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(
 	luxrays::Properties &props,unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,
 	const std::string &inputSocketName,const std::string &propName,bool includeTexturePrefix,bool output,bool ignoreConcreteValueIfNoInputLinked
@@ -345,13 +362,13 @@ std::optional<luxrays::Property> LuxNodeManager::datavalue_to_property(LuxNodeCa
 		static_assert(std::is_same_v<unirender::STColor,unirender::STVector>);
 		static_assert(std::is_same_v<unirender::STColor,unirender::STPoint>);
 		static_assert(std::is_same_v<unirender::STColor,unirender::STNormal>);
-		auto &col = *dataValue.ToValue<unirender::STColor>();
+		auto col = *dataValue.ToValue<unirender::STColor>();
 		prop(col.x,col.y,col.z);
 		break;
 	}
 	case unirender::SocketType::Point2:
 	{
-		auto &col = *dataValue.ToValue<unirender::STPoint2>();
+		auto col = *dataValue.ToValue<unirender::STPoint2>();
 		prop(col.x,col.y);
 		break;
 	}
@@ -375,13 +392,13 @@ std::optional<luxrays::Property> LuxNodeManager::datavalue_to_property(LuxNodeCa
 		return {}; // Unsupported
 	case unirender::SocketType::FloatArray:
 	{
-		auto &floatArray = *dataValue.ToValue<unirender::STFloatArray>();
+		auto floatArray = *dataValue.ToValue<unirender::STFloatArray>();
 		prop(floatArray);
 		break;
 	}
 	case unirender::SocketType::ColorArray:
 	{
-		auto &colorArray = *dataValue.ToValue<unirender::STColorArray>();
+		auto colorArray = *dataValue.ToValue<unirender::STColorArray>();
 		std::vector<float> lxArray;
 		lxArray.resize(colorArray.size() *sizeof(colorArray.front()) /sizeof(float));
 		memcpy(lxArray.data(),colorArray.data(),colorArray.size() *sizeof(colorArray.front()));
@@ -590,32 +607,68 @@ void LuxNodeManager::Initialize()
 		return props;
 	});
 	RegisterFactory(unirender::NODE_OUTPUT,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto hasVolume = false;
+		auto *fromSocketVol = find_socket_linked_to_input(rootNode,node,unirender::nodes::output::IN_VOLUME);
+		if(fromSocketVol)
+		{
+			auto propsVol = ConvertLinkedNode(renderer,rootNode,*fromSocketVol,nodeCache);
+			if(propsVol)
+			{
+				luxrays::Property prop {"scene.materials." +renderer.GetCurrentShaderName() +".volume.interior"};
+				prop(nodeCache.ToLinkedSocketName(*fromSocketVol));
+				props<<prop;
+				hasVolume = true;
+			}
+		}
+		
 		auto *fromSocket = find_socket_linked_to_input(rootNode,node,unirender::nodes::output::IN_SURFACE);
 		if(fromSocket == nullptr)
+		{
+			if(hasVolume)
+			{
+				luxrays::Property prop {"scene.materials." +renderer.GetCurrentShaderName() +".type"};
+				prop("null");
+				props<<prop;
+				renderer.GetLuxScene().Parse(props);
+				return props;
+			}
 			return {};
+		}
 		if(fromSocket->IsConcreteValue())
 		{
 			// TODO: Emission shader
+			return {};
+		}
+		auto *inputNode = fromSocket->GetNode();
+		if(inputNode == nullptr)
+			return {};
 
-		}
-		else
-		{
-			auto *inputNode = fromSocket->GetNode();
-			if(inputNode == nullptr)
-				return {};
-			return ConvertLinkedNode(renderer,rootNode,*fromSocket,nodeCache);
-		}
-		luxrays::Properties props {};
+		auto tmpProps = ConvertLinkedNode(renderer,rootNode,*fromSocket,nodeCache);
+		if(!tmpProps.has_value())
+			return {};
+		props<<*tmpProps;
+		renderer.GetLuxScene().Parse(props);
 		return props;
 	});
 	RegisterFactory(unirender::NODE_PRINCIPLED_BSDF,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		luxrays::Properties props {};
-		auto propName = "scene.materials." +nodeCache.ToLinkedSocketName(outputSocket);
+		auto propName = "scene.materials." +renderer.GetCurrentShaderName();
+
+		auto opName = math_type_to_luxcore_op(unirender::nodes::math::MathType::Multiply);
+		assert(!opName.empty());
+		auto propNameSss = "scene.textures." +nodeCache.ToLinkedSocketName(outputSocket) +"_sss";
+		props<<luxrays::Property(propNameSss +".type")(opName);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SUBSURFACE,propNameSss +".texture1",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SUBSURFACE_COLOR,propNameSss +".texture2",false);
+
 		props<<luxrays::Property(propName +".type")("disney");
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_BASE_COLOR,propName +".basecolor",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ROUGHNESS,propName +".roughness",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_METALLIC,propName +".metallic",false);
-		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SUBSURFACE,propName +".subsurface",false);
+		props<<luxrays::Property(propName +".subsurface")(nodeCache.ToLinkedSocketName(outputSocket) +"_sss");
+		//props<<luxrays::Property(propName +".subsurface")("100 100 100");
+		//ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SUBSURFACE,propName +".subsurface",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SPECULAR,propName +".specular",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_SPECULAR_TINT,propName +".speculartint",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_CLEARCOAT,propName +".clearcoat",false);
@@ -639,7 +692,7 @@ void LuxNodeManager::Initialize()
 	});
 	RegisterFactory(unirender::NODE_GLASS_BSDF,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		luxrays::Properties props {};
-		auto propName = "scene.materials." +nodeCache.ToLinkedSocketName(outputSocket);
+		auto propName = "scene.materials." +renderer.GetCurrentShaderName();
 		props<<luxrays::Property(propName +".type")("glass");
 		// 0.0031 is the dispersion for water and is only used for testing purposes (see https://wiki.luxcorerender.org/Glass_Material_IOR_and_Dispersion#Refractive_Index_and_Dispersion_Data)
 		// This should be an input parameter!
@@ -652,6 +705,56 @@ void LuxNodeManager::Initialize()
 			props<<luxrays::Property(propName +".photongi.enable")("1");
 
 		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ALPHA,propName +".transparency",false);
+		return props;
+	});
+	RegisterFactory(unirender::NODE_VOLUME_CLEAR,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+
+		auto baseName = nodeCache.ToLinkedSocketName(outputSocket);
+		auto volName = "scene.volumes." +baseName;
+		props<<luxrays::Property(volName +".type")("clear");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_PRIORITY,volName +".priority",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_IOR,volName +".ior",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_ABSORPTION,volName +".absorption",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_EMISSION,volName +".emission",false);
+		renderer.SetDefaultWorldVolume(baseName);
+		return props;
+	});
+	RegisterFactory(unirender::NODE_VOLUME_HOMOGENEOUS,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+
+		auto baseName = nodeCache.ToLinkedSocketName(outputSocket);
+		auto volName = "scene.volumes." +baseName;
+		props<<luxrays::Property(volName +".type")("homogeneous");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_PRIORITY,volName +".priority",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_IOR,volName +".ior",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_ABSORPTION,volName +".absorption",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_EMISSION,volName +".emission",false);
+
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_SCATTERING,volName +".scattering",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_ASYMMETRY,volName +".asymmetry",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_MULTI_SCATTERING,volName +".multiscattering",false);
+		renderer.SetDefaultWorldVolume(baseName);
+		return props;
+	});
+	RegisterFactory(unirender::NODE_VOLUME_HETEROGENEOUS,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+
+		auto baseName = nodeCache.ToLinkedSocketName(outputSocket);
+		auto volName = "scene.volumes." +baseName;
+		props<<luxrays::Property(volName +".type")("heterogeneous");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_PRIORITY,volName +".priority",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_IOR,volName +".ior",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_ABSORPTION,volName +".absorption",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_EMISSION,volName +".emission",false);
+
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_SCATTERING,volName +".scattering",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_ASYMMETRY,volName +".asymmetry",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_MULTI_SCATTERING,volName +".multiscattering",false);
+
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_STEP_SIZE,volName +".steps.size",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_STEP_MAX_COUNT,volName +".steps.maxcount",false);
+		renderer.SetDefaultWorldVolume(baseName);
 		return props;
 	});
 	RegisterFactory(unirender::NODE_SEPARATE_XYZ,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
@@ -1632,6 +1735,9 @@ util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> Renderer::StartRender()
 bool Renderer::Initialize(Flags flags)
 {
 	PrepareCyclesSceneForRendering();
+
+	m_enablePhotonGiCache = GetScene().GetCreateInfo().preCalculateLight;
+
 	auto &logHandler = unirender::get_log_handler();
 	luxcore::Init();
 	if(logHandler)
@@ -1711,10 +1817,25 @@ bool Renderer::Initialize(Flags flags)
 			SyncMesh(*o);
 	}
 	m_shaderNodeIdx = 0;
+	m_curShaderIdx = 0;
 	for(auto &chunk : mdlCache->GetChunks())
 	{
 		for(auto &o : chunk.GetObjects())
 			SyncObject(*o);
+	}
+
+	auto &defWorldVolume = GetDefaultWorldVolume();
+	if(!defWorldVolume.empty())
+	{
+		luxrays::Properties props {};
+		/*for(auto &shader : m_objectShaders)
+		{
+			if(shader == defWorldVolume)
+				continue;
+			props<<luxrays::Property("scene.materials." +shader +".volume.exterior")(defWorldVolume);
+		}*/
+		props<<luxrays::Property("scene.world.volume.default")(defWorldVolume);
+		m_lxScene->Parse(props);
 	}
 
 	auto &createInfo = const_cast<unirender::Scene::CreateInfo&>(m_scene->GetCreateInfo());
@@ -2072,9 +2193,15 @@ void Renderer::SyncObject(const unirender::Object &obj)
 			if(factory)
 			{
 				auto fDefineShader = [&](std::string &matName,LuxNodeCache &nodeCache) {
+					m_curShaderName = "shader_" +std::to_string(m_curShaderIdx++);
+					matName = m_curShaderName;
 					unirender::Socket sock {*node,"in",true /* output */};
 					auto properties = (*factory)(*this,*desc,*node,sock,nodeCache);
-					if(properties.has_value())
+					if(!properties.has_value())
+						matName = "";
+					else
+						m_objectShaders.push_back(matName);
+					/*if(properties.has_value())
 					{
 						auto &names = properties->GetAllNames();
 						for(auto &name : names)
@@ -2089,7 +2216,7 @@ void Renderer::SyncObject(const unirender::Object &obj)
 								sub = sub.substr(0,pos);
 							matName = sub;
 						}
-					}
+					}*/
 				};
 				fDefineShader(matName,nodeCache);
 				if(hasHair)
@@ -2387,19 +2514,21 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 			lxUvChannels[LIGHTMAP_UV_CHANNEL] = reinterpret_cast<float*>(lxLightmapUvs);
 			m_lightmapMeshes.insert(&mesh);
 		}
-		auto enableSubdivision = m_enableMeshSubdivision;
+		auto &shader = mesh.GetSubMeshShaders()[iShader];
+		auto &subdivSettings = shader->GetSubdivisionSettings();
 		auto name = GetName(mesh,iShader);
-		if(enableSubdivision)
+		if(subdivSettings)
 			name += "_base";
 		m_lxScene->DefineMeshExt(name,numMeshVerts,numMeshTris,reinterpret_cast<float*>(points),reinterpret_cast<unsigned int*>(lxTris),reinterpret_cast<float*>(lxNormals),&lxUvChannels,nullptr,nullptr);
-		if(enableSubdivision)
+		if(subdivSettings)
 		{
 			luxrays::Properties props {};
 			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".type")("subdiv");
 			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".source")(name);
+			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".maxlevel")(subdivSettings->maxLevel);
+			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".maxedgescreensize")(subdivSettings->maxEdgeScreenSize);
 			m_lxScene->Parse(props);
 		}
-		auto &shader = mesh.GetSubMeshShaders()[iShader];
 		auto &hairConfig = shader->GetHairConfig();
 		if(hairConfig.has_value() == false)
 			continue;
@@ -2631,3 +2760,4 @@ void Renderer::PrepareCyclesSceneForRendering()
 {
 	unirender::Renderer::PrepareCyclesSceneForRendering();
 }
+#pragma optimize("",on)

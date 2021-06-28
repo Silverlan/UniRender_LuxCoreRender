@@ -83,6 +83,10 @@ namespace unirender::luxcorerender
 		luxcore::Scene &GetLuxScene() {return *m_lxScene;}
 		bool ShouldUsePhotonGiCache() const {return m_enablePhotonGiCache;}
 		bool ShouldUseHairShader() const {return m_useHairShader;}
+		const std::string &GetCurrentShaderName() const {return m_curShaderName;}
+
+		const std::string &GetDefaultWorldVolume() const {return m_defaultWorldVolume;}
+		void SetDefaultWorldVolume(const std::string &vol) {m_defaultWorldVolume = vol;}
 
 		virtual ~Renderer() override;
 		virtual void Wait() override;
@@ -128,7 +132,11 @@ namespace unirender::luxcorerender
 		std::vector<std::string> m_bakeObjectNames {};
 		std::unordered_set<const unirender::Mesh*> m_lightmapMeshes {};
 		unirender::Object *m_bakeTarget = nullptr;
+		std::vector<std::string> m_objectShaders;
 		uint32_t m_shaderNodeIdx = 0;
+		uint32_t m_curShaderIdx = 0;
+		std::string m_curShaderName;
+		std::string m_defaultWorldVolume;
 		std::atomic<float> m_progress = 0.f;
 		std::unique_ptr<luxcore::Scene> m_lxScene = nullptr;
 		std::unique_ptr<luxcore::RenderConfig> m_lxConfig = nullptr;
@@ -137,7 +145,6 @@ namespace unirender::luxcorerender
 		
 		RenderEngine m_renderEngine = RenderEngine::PathTracer;
 		bool m_enablePhotonGiCache = false;
-		bool m_enableMeshSubdivision = false;
 		bool m_enableLightSamplingCache = false;
 	};
 };
