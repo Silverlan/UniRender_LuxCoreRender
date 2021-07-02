@@ -559,6 +559,13 @@ static std::string math_type_to_luxcore_op(unirender::nodes::math::MathType math
 	return opName;
 }
 
+// These *should* be exported by the OpenEXR library, but for some reason don't,
+// so we re-define them here
+#include "OpenEXR/half.h"
+const half::uif half::_toFloat[1 << 16] =
+    #include "OpenEXR/toFloat.h"
+const unsigned short half::_eLut[1 << 9] =
+    #include "OpenEXR/eLut.h"
 void LuxNodeManager::Initialize()
 {
 	if(m_initialized)
@@ -930,9 +937,10 @@ void LuxNodeManager::Initialize()
 ////////////
 
 extern "C" {
-	std::shared_ptr<unirender::Renderer> __declspec(dllexport) create_renderer(const unirender::Scene &scene,unirender::Renderer::Flags flags)
+	bool __declspec(dllexport) create_renderer(const unirender::Scene &scene,unirender::Renderer::Flags flags,std::shared_ptr<unirender::Renderer> &outRenderer)
 	{
-		return Renderer::Create(scene,flags);
+		outRenderer = Renderer::Create(scene,flags);
+		return outRenderer != nullptr;
 	}
 };
 
