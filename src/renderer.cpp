@@ -559,13 +559,6 @@ static std::string math_type_to_luxcore_op(unirender::nodes::math::MathType math
 	return opName;
 }
 
-// These *should* be exported by the OpenEXR library, but for some reason don't,
-// so we re-define them here
-#include "OpenEXR/half.h"
-const half::uif half::_toFloat[1 << 16] =
-    #include "OpenEXR/toFloat.h"
-const unsigned short half::_eLut[1 << 9] =
-    #include "OpenEXR/eLut.h"
 void LuxNodeManager::Initialize()
 {
 	if(m_initialized)
@@ -714,6 +707,23 @@ void LuxNodeManager::Initialize()
 		// ConvertSocketLinkedToInputToProperty(props,scene,rootNode,nodeCache,node,unirender::nodes::principled_bsdf::IN_ALPHA,propName +".transparency",false);
 		return props;
 	});
+	RegisterFactory(unirender::NODE_GLOSSY_BSDF,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
+		luxrays::Properties props {};
+		auto propName = "scene.materials." +renderer.GetCurrentShaderName();
+		props<<luxrays::Property(propName +".type")("glossytranslucent");
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glossy_bsdf::IN_COLOR,propName +".kd",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glossy_bsdf::IN_ROUGHNESS,propName +".uroughness_bf",false);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glossy_bsdf::IN_ROUGHNESS,propName +".vroughness_bf",false);
+
+		if(renderer.ShouldUseHairShader() == false) // Normal map causes hair to be black for some reason
+			ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glossy_bsdf::IN_NORMAL,propName +".normaltex",false,false,true);
+
+		if(renderer.ShouldUsePhotonGiCache())
+			props<<luxrays::Property(propName +".photongi.enable")("1");
+		
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::glossy_bsdf::IN_ALPHA,propName +".transparency",false);
+		return props;
+	});
 	RegisterFactory(unirender::NODE_VOLUME_CLEAR,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
 		luxrays::Properties props {};
 
@@ -724,7 +734,11 @@ void LuxNodeManager::Initialize()
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_IOR,volName +".ior",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_ABSORPTION,volName +".absorption",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_clear::IN_EMISSION,volName +".emission",false);
-		renderer.SetDefaultWorldVolume(baseName);
+
+		auto defWorldVol = node.GetPropertyValue<bool>(unirender::nodes::volume_homogeneous::IN_DEFAULT_WORLD_VOLUME);
+		if(defWorldVol.has_value())
+			renderer.SetDefaultWorldVolume(baseName);
+
 		return props;
 	});
 	RegisterFactory(unirender::NODE_VOLUME_HOMOGENEOUS,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
@@ -741,7 +755,12 @@ void LuxNodeManager::Initialize()
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_SCATTERING,volName +".scattering",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_ASYMMETRY,volName +".asymmetry",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_MULTI_SCATTERING,volName +".multiscattering",false);
-		renderer.SetDefaultWorldVolume(baseName);
+		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_homogeneous::IN_ABSORPTION_DEPTH,volName +".d",0.01f);
+
+		auto defWorldVol = node.GetPropertyValue<bool>(unirender::nodes::volume_homogeneous::IN_DEFAULT_WORLD_VOLUME);
+		if(defWorldVol.has_value())
+			renderer.SetDefaultWorldVolume(baseName);
+
 		return props;
 	});
 	RegisterFactory(unirender::NODE_VOLUME_HETEROGENEOUS,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
@@ -761,7 +780,11 @@ void LuxNodeManager::Initialize()
 
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_STEP_SIZE,volName +".steps.size",false);
 		ConvertSocketLinkedToInputToProperty(props,renderer,rootNode,nodeCache,node,unirender::nodes::volume_heterogeneous::IN_STEP_MAX_COUNT,volName +".steps.maxcount",false);
-		renderer.SetDefaultWorldVolume(baseName);
+
+		auto defWorldVol = node.GetPropertyValue<bool>(unirender::nodes::volume_homogeneous::IN_DEFAULT_WORLD_VOLUME);
+		if(defWorldVol.has_value())
+			renderer.SetDefaultWorldVolume(baseName);
+
 		return props;
 	});
 	RegisterFactory(unirender::NODE_SEPARATE_XYZ,[this](unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,unirender::NodeDesc &node,const unirender::Socket &outputSocket,LuxNodeCache &nodeCache) -> std::optional<luxrays::Properties> {
@@ -2768,4 +2791,13 @@ void Renderer::PrepareCyclesSceneForRendering()
 {
 	unirender::Renderer::PrepareCyclesSceneForRendering();
 }
+
+// These *should* be exported by the OpenEXR library, but for some reason don't,
+// so we re-define them here
+#include "OpenEXR/half.h"
+const half::uif half::_toFloat[1 << 16] =
+    #include "OpenEXR/toFloat.h";
+const unsigned short half::_eLut[1 << 9] =
+    #include "OpenEXR/eLut.h";
+
 #pragma optimize("",on)
