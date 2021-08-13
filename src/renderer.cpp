@@ -1114,13 +1114,13 @@ std::string Renderer::TranslateOutputTypeToLuxCoreRender(const std::string &type
 	return type.c_str();
 }
 
-uimg::ImageBuffer::Format Renderer::GetOutputFormat(Scene::RenderMode renderMode)
+uimg::Format Renderer::GetOutputFormat(Scene::RenderMode renderMode)
 {
 	switch(renderMode)
 	{
 	case Scene::RenderMode::RenderImage:
 	case Scene::RenderMode::BakeDiffuseLighting:
-		return uimg::ImageBuffer::Format::RGBA32;
+		return uimg::Format::RGBA32;
 	case Scene::RenderMode::SceneAlbedo:
 	case Scene::RenderMode::SceneNormals:
 	case Scene::RenderMode::GeometryNormal:
@@ -1143,15 +1143,15 @@ uimg::ImageBuffer::Format Renderer::GetOutputFormat(Scene::RenderMode renderMode
 	case Scene::RenderMode::IndirectSpecularTransmit:
 	case Scene::RenderMode::Irradiance:
 	case Scene::RenderMode::Caustic:
-		return uimg::ImageBuffer::Format::RGB32;
+		return uimg::Format::RGB32;
 	case Scene::RenderMode::Uv:
-		return uimg::ImageBuffer::Format::RG32;
+		return uimg::Format::RG32;
 	case Scene::RenderMode::SceneDepth:
 	case Scene::RenderMode::Noise:
 	case Scene::RenderMode::Alpha:
-		return uimg::ImageBuffer::Format::R32;
+		return uimg::Format::R32;
 	}
-	return uimg::ImageBuffer::Format::RGBA32;
+	return uimg::Format::RGBA32;
 }
 
 luxcore::Film::FilmOutputType Renderer::GetLuxCoreFilmOutputType(Scene::RenderMode renderMode)
@@ -1361,15 +1361,15 @@ void Renderer::UpdateProgressiveRender()
 	if(useFloatFormat)
 	{
 		tileData.flags |= TileManager::TileData::Flags::Initialized;
-		auto format = uimg::ImageBuffer::Format::RGBA32;
+		auto format = uimg::Format::RGBA32;
 		tileData.data.resize(resolution.x *resolution.y *uimg::ImageBuffer::GetPixelSize(format));
 		imgBuf = uimg::ImageBuffer::Create(tileData.data.data(),resolution.x,resolution.y,format);
 	}
 	else
 	{
 		tileData.flags |= TileManager::TileData::Flags::HDRData | TileManager::TileData::Flags::Initialized;
-		tileData.data.resize(resolution.x *resolution.y *uimg::ImageBuffer::GetPixelSize(uimg::ImageBuffer::Format::RGBA16));
-		imgBuf = uimg::ImageBuffer::Create(resolution.x,resolution.y,uimg::ImageBuffer::Format::RGBA32);
+		tileData.data.resize(resolution.x *resolution.y *uimg::ImageBuffer::GetPixelSize(uimg::Format::RGBA16));
+		imgBuf = uimg::ImageBuffer::Create(resolution.x,resolution.y,uimg::Format::RGBA32);
 	}
 	m_lxSession->GetFilm().GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_RGBA,reinterpret_cast<float*>(imgBuf->GetData()));
 	imgBuf->FlipVertically();
@@ -1383,7 +1383,7 @@ void Renderer::UpdateProgressiveRender()
 
 	if(!useFloatFormat)
 	{
-		auto imgBufDst = uimg::ImageBuffer::Create(tileData.data.data(),resolution.x,resolution.y,uimg::ImageBuffer::Format::RGBA16);
+		auto imgBufDst = uimg::ImageBuffer::Create(tileData.data.data(),resolution.x,resolution.y,uimg::Format::RGBA16);
 		imgBuf->Convert(*imgBufDst);
 	}
 
@@ -1426,7 +1426,7 @@ void Renderer::FinalizeImage(uimg::ImageBuffer &imgBuf,StereoEye eyeStage)
 	if(resultAlphaBuf)
 	{
 		for(auto &px : *resultAlphaBuf)
-			imgBuf.GetPixelView(px.GetX(),px.GetY()).SetValue(uimg::ImageBuffer::Channel::A,px.GetFloatValue(uimg::ImageBuffer::Channel::R));
+			imgBuf.GetPixelView(px.GetX(),px.GetY()).SetValue(uimg::Channel::A,px.GetFloatValue(uimg::Channel::R));
 	}
 
 	imgBuf.FlipVertically();
@@ -1560,7 +1560,7 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 						worker.SetStatus(util::JobStatus::Failed,"Lightmap atlas exr has incorrect number of channels!");
 						return RenderStageResult::Complete;
 					}
-					resultImageBuffer = uimg::ImageBuffer::Create(width,height,uimg::ImageBuffer::Format::RGBA_FLOAT);
+					resultImageBuffer = uimg::ImageBuffer::Create(width,height,uimg::Format::RGBA_FLOAT);
 					memcpy(resultImageBuffer->GetData(),exrImg.images[0],resultImageBuffer->GetSize());
 #else
 					// Technically deprecated, but above code doesn't work
@@ -1578,7 +1578,7 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 					}
 					width = w;
 					height = h;
-					resultImageBuffer = uimg::ImageBuffer::CreateWithCustomDeleter(rgba,width,height,uimg::ImageBuffer::Format::RGBA_FLOAT,[](void *ptr) {free(ptr);});
+					resultImageBuffer = uimg::ImageBuffer::CreateWithCustomDeleter(rgba,width,height,uimg::Format::RGBA_FLOAT,[](void *ptr) {free(ptr);});
 					resultImageBuffer->FlipVertically();
 #endif
 				}
@@ -1611,7 +1611,7 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 					if(itAlpha != m_outputs.end())
 					{
 						auto &resultAlphaBuf = GetResultImageBuffer(OUTPUT_ALPHA,eyeStage);
-						resultAlphaBuf = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::R32);
+						resultAlphaBuf = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::Format::R32);
 						film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_ALPHA,static_cast<float*>(resultAlphaBuf->GetData()));
 					}
 				}
@@ -1631,8 +1631,8 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 				{
 					auto &albedoImageBuffer = GetResultImageBuffer(OUTPUT_ALBEDO,eyeStage);
 					auto &normalImageBuffer = GetResultImageBuffer(OUTPUT_NORMAL,eyeStage);
-					albedoImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGB_FLOAT);
-					normalImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::ImageBuffer::Format::RGB_FLOAT);
+					albedoImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::Format::RGB_FLOAT);
+					normalImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),uimg::Format::RGB_FLOAT);
 					film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_ALBEDO,static_cast<float*>(albedoImageBuffer->GetData()));
 					film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_AVG_SHADING_NORMAL,static_cast<float*>(normalImageBuffer->GetData()));
 					albedoImageBuffer->ClearAlpha();
@@ -1640,7 +1640,7 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 
 					static auto dbgOutputAlbedo = false;
 					if(dbgOutputAlbedo)
-						resultImageBuffer = albedoImageBuffer->Copy(uimg::ImageBuffer::Format::RGBA_FLOAT);
+						resultImageBuffer = albedoImageBuffer->Copy(uimg::Format::RGBA_FLOAT);
 				}
 				break;
 			}
@@ -1649,13 +1649,13 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 				resultImageBuffer = uimg::ImageBuffer::Create(film.GetWidth(),film.GetHeight(),GetOutputFormat(renderMode));
 				film.GetOutput<float>(GetLuxCoreFilmOutputType(renderMode),static_cast<float*>(resultImageBuffer->GetData()));
 				auto numChannels = resultImageBuffer->GetChannelCount();
-				resultImageBuffer->Convert(uimg::ImageBuffer::Format::RGBA32);
+				resultImageBuffer->Convert(uimg::Format::RGBA32);
 				if(numChannels == 1)
 				{
 					for(auto &pxView : *resultImageBuffer)
 					{
-						pxView.SetValue(uimg::ImageBuffer::Channel::G,pxView.GetFloatValue(uimg::ImageBuffer::Channel::R));
-						pxView.SetValue(uimg::ImageBuffer::Channel::B,pxView.GetFloatValue(uimg::ImageBuffer::Channel::R));
+						pxView.SetValue(uimg::Channel::G,pxView.GetFloatValue(uimg::Channel::R));
+						pxView.SetValue(uimg::Channel::B,pxView.GetFloatValue(uimg::Channel::R));
 					}
 				}
 				break;
@@ -1682,7 +1682,7 @@ bool Renderer::FinalizeLightmap(const std::string &inputPath,const std::string &
 		return false;
 	uint32_t width = w;
 	uint32_t height = h;
-	auto resultImageBuffer = uimg::ImageBuffer::CreateWithCustomDeleter(rgba,width,height,uimg::ImageBuffer::Format::RGBA_FLOAT,[](void *ptr) {free(ptr);});
+	auto resultImageBuffer = uimg::ImageBuffer::CreateWithCustomDeleter(rgba,width,height,uimg::Format::RGBA_FLOAT,[](void *ptr) {free(ptr);});
 	resultImageBuffer->FlipVertically();
 
 	float exposureMul = 0.02f;
@@ -1695,7 +1695,7 @@ bool Renderer::FinalizeLightmap(const std::string &inputPath,const std::string &
 	denoiseInfo.height = resultImageBuffer->GetHeight();
 	denoiseInfo.lightmap = true;
 
-	resultImageBuffer->Convert(uimg::ImageBuffer::Format::RGB_FLOAT);
+	resultImageBuffer->Convert(uimg::Format::RGB_FLOAT);
 	denoise(denoiseInfo,*resultImageBuffer,nullptr,nullptr,[this](float progress) -> bool {
 		return true;
 	});
@@ -1706,18 +1706,19 @@ bool Renderer::FinalizeLightmap(const std::string &inputPath,const std::string &
 		if(m_colorTransformProcessor->Apply(*resultImageBuffer,err,0.f,m_scene->GetGamma()) == false)
 			m_scene->HandleError("Unable to apply color transform: " +err);
 	}
-	resultImageBuffer->Convert(uimg::ImageBuffer::Format::RGBA_HDR);
+	resultImageBuffer->Convert(uimg::Format::RGBA_HDR);
 	resultImageBuffer->ClearAlpha();
 	FinalizeImage(*resultImageBuffer,unirender::Renderer::StereoEye::Left);
 
-	uimg::TextureInfo texInfo {};
+	uimg::TextureSaveInfo texSaveInfo {};
+	auto &texInfo = texSaveInfo.texInfo;
 	texInfo.containerFormat = uimg::TextureInfo::ContainerFormat::DDS;
 	texInfo.inputFormat = uimg::TextureInfo::InputFormat::R16G16B16A16_Float;
 	texInfo.outputFormat = uimg::TextureInfo::OutputFormat::BC6;
 	texInfo.flags = uimg::TextureInfo::Flags::GenerateMipmaps;
 //	auto f = FileManager::OpenFile<VFilePtrReal>("materials/maps/sfm_gtav_mp_apa_06/lightmap_atlas.dds","wb");
 //	if(f)
-	return uimg::save_texture(outputPath,*resultImageBuffer,texInfo,false);
+	return uimg::save_texture(outputPath,*resultImageBuffer,texSaveInfo);
 }
 bool Renderer::UpdateStereoEye(unirender::RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye &eyeStage)
 {

@@ -70,7 +70,7 @@ namespace unirender::luxcorerender
 		static constexpr const char *OUTPUT_CAUSTIC = "OUTPUT_CAUSTIC";
 		static std::string GetOutputType(Scene::RenderMode renderMode);
 		static luxcore::Film::FilmOutputType GetLuxCoreFilmOutputType(Scene::RenderMode renderMode);
-		static uimg::ImageBuffer::Format GetOutputFormat(Scene::RenderMode renderMode);
+		static uimg::Format GetOutputFormat(Scene::RenderMode renderMode);
 
 		static Vector3 ToPragmaPosition(const luxrays::Vector &pos);
 		static luxrays::Vector ToLuxVector(const Vector3 &v);
