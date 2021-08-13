@@ -14,6 +14,7 @@
 #include <util_raytracing/model_cache.hpp>
 #include <util_raytracing/color_management.hpp>
 #include <util_raytracing/denoise.hpp>
+#include <util_raytracing/subdivision.hpp>
 #include <util_ocio.hpp>
 #include <mathutil/umath_lighting.hpp>
 #include <sharedutils/util_string.h>
@@ -1806,6 +1807,14 @@ bool Renderer::Initialize(Flags flags)
 					luxrays::Property(propName +".file")(*absPath)<<
 					luxrays::Property(propName +".gain")(gain.x,gain.y,gain.z)<<
 					luxrays::Property(propName +".gamma")(gamma)<<
+
+					// See https://forums.luxcorerender.org/viewtopic.php?f=5&t=93#p1410
+					luxrays::Property(propName +".visibilitymap.enable")(1)<<
+					luxrays::Property(propName +".visibilitymap.samples")(1000000)<<
+					luxrays::Property(propName +".visibilitymap.width")(512)<<
+					luxrays::Property(propName +".visibilitymap.height")(256)<<
+					luxrays::Property(propName +".visibilitymap.maxdepth")(4)<<
+
 					to_luxcore_matrix(propName +".transformation",pose)
 				);
 			}
@@ -2400,7 +2409,7 @@ void Renderer::SyncLight(const unirender::Light &light)
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
 		props<<luxrays::Property(propName +".target")(target.x,target.y,target.z);
 		props<<luxrays::Property(propName +".coneangle")(light.GetOuterConeAngle());
-		props<<luxrays::Property(propName +".conedeltaangle")(light.GetInnerConeAngle());
+		props<<luxrays::Property(propName +".conedeltaangle")(light.GetOuterConeAngle() -light.GetInnerConeAngle());
 		break;
 	}
 	case unirender::Light::Type::Point:
@@ -2430,20 +2439,7 @@ void Renderer::SyncLight(const unirender::Light &light)
 	m_lxScene->Parse(props);
 }
 
-class LuxShaderNode
-{
-public:
-	uint32_t nodeIndex = 0u;
-private:
-};
-
-class LuxShader
-{
-public:
-private:
-	uint32_t m_curNode = 0;
-};
-
+#include <mathutil/vertex.hpp>
 void Renderer::SyncMesh(const unirender::Mesh &mesh)
 {
 	auto &shaders = mesh.GetSubMeshShaders();
@@ -2553,6 +2549,26 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 		m_lxScene->DefineMeshExt(name,numMeshVerts,numMeshTris,reinterpret_cast<float*>(points),reinterpret_cast<unsigned int*>(lxTris),reinterpret_cast<float*>(lxNormals),&lxUvChannels,nullptr,nullptr);
 		if(subdivSettings)
 		{
+			/*if(true)
+			{
+				std::vector<umath::Vertex> tmpVerts;
+				auto numVerts = verts.size();
+				tmpVerts.reserve(numVerts);
+				for(auto i=decltype(numVerts){0};i<numVerts;++i)
+				{
+					tmpVerts.push_back({});
+					auto &v = tmpVerts.back();
+					v.position = verts[i];
+					v.uv = uvs[i];
+					v.normal = normals[i];
+				}
+				std::vector<umath::Vertex> newVerts;
+				std::vector<int> newTris;
+				uint32_t subDivLevel = 2;
+				unirender::subdivide_mesh(tmpVerts,tris,newVerts,newTris,subDivLevel);
+				std::cout<<"";
+			}*/
+
 			luxrays::Properties props {};
 			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".type")("subdiv");
 			props<<luxrays::Property("scene.shapes." +GetName(mesh,iShader) +".source")(name);
