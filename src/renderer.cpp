@@ -232,23 +232,6 @@ unirender::Socket *LuxNodeManager::find_socket_linked_to_input(unirender::GroupN
 	return find_socket_linked_to_input(rootNode,sock);
 }
 
-namespace OpenColorIO_v2_0
-{
-	const char * ROLE_DEFAULT             = "default";
-	const char * ROLE_REFERENCE           = "reference";
-	const char * ROLE_DATA                = "data";
-	const char * ROLE_COLOR_PICKING       = "color_picking";
-	const char * ROLE_SCENE_LINEAR        = "scene_linear";
-	const char * ROLE_COMPOSITING_LOG     = "compositing_log";
-	const char * ROLE_COLOR_TIMING        = "color_timing";
-	const char * ROLE_TEXTURE_PAINT       = "texture_paint";
-	const char * ROLE_MATTE_PAINT         = "matte_paint";
-	const char * ROLE_RENDERING           = "rendering";
-	const char * ROLE_INTERCHANGE_SCENE   = "aces_interchange";
-	const char * ROLE_INTERCHANGE_DISPLAY = "cie_xyz_d65_interchange";
-	const char * OCIO_VIEW_USE_DISPLAY_NAME = "<USE_DISPLAY_NAME>";
-};
-
 bool LuxNodeManager::ConvertSocketLinkedToInputToProperty(
 	luxrays::Properties &props,unirender::luxcorerender::Renderer &renderer,unirender::GroupNodeDesc &rootNode,LuxNodeCache &nodeCache,unirender::NodeDesc &node,
 	const std::string &inputSocketName,const std::string &propName,bool includeTexturePrefix,bool output,bool ignoreConcreteValueIfNoInputLinked
@@ -912,7 +895,7 @@ void LuxNodeManager::Initialize()
 		if(val.has_value())
 		{
 			auto colorSpace = val->ToValue<std::string>();
-			if(colorSpace.has_value() && ustring::compare(*colorSpace,unirender::nodes::image_texture::COLOR_SPACE_SRGB) == false)
+			if(colorSpace.has_value() && ustring::compare<std::string>(*colorSpace,unirender::nodes::image_texture::COLOR_SPACE_SRGB) == false)
 				props<<luxrays::Property(propName +".gamma")(1);
 		}
 
@@ -1950,6 +1933,49 @@ bool Renderer::Initialize(Flags flags)
 	props<<luxrays::Property("film.opencl.platform")("-1");
 	props<<luxrays::Property("film.opencl.device")("-1");
 
+	enum class AcceleratorType : uint8_t
+	{
+		Auto = 0,
+		BVH,
+		MBVH,
+		QBVH,
+		MQBVH,
+		Embree
+	};
+	auto f = filemanager::open_file("accelerator_type.txt",filemanager::FileMode::Read);
+	if(f)
+	{
+		auto accType = f->ReadString();
+		f = nullptr;
+		ustring::replace(accType,"\n","");
+		ustring::replace(accType,"\r","");
+		ustring::replace(accType," ","");
+		std::cout<<"Using accelerator type "<<accType<<std::endl;
+		props<<luxrays::Property("accelerator.type")(accType);
+	}
+	/*auto accType = AcceleratorType::Auto;
+	switch(accType)
+	{
+	case AcceleratorType::Auto:
+		props<<luxrays::Property("accelerator.type")("AUTO");
+		break;
+	case AcceleratorType::BVH:
+		props<<luxrays::Property("accelerator.type")("BVH");
+		break;
+	case AcceleratorType::MBVH:
+		props<<luxrays::Property("accelerator.type")("MBVH");
+		break;
+	case AcceleratorType::QBVH:
+		props<<luxrays::Property("accelerator.type")("QBVH");
+		break;
+	case AcceleratorType::MQBVH:
+		props<<luxrays::Property("accelerator.type")("MQBVH");
+		break;
+	case AcceleratorType::Embree:
+		props<<luxrays::Property("accelerator.type")("EMBREE");
+		break;
+	}*/
+
 	if(m_enablePhotonGiCache)
 	{
 		// See https://forums.luxcorerender.org/viewtopic.php?t=840
@@ -2051,7 +2077,7 @@ bool Renderer::Initialize(Flags flags)
 	}
 	if(bakeLightmaps && m_bakeObjectNames.empty() == false)
 	{
-		FileManager::CreatePath((util::Path::CreateFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME).GetPath()).c_str());
+		FileManager::CreatePath((util::Path::CreateFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME).GetPath()).data());
 		props<<luxrays::Property("film.outputs.0.type")("RGBA");
 		props<<luxrays::Property("film.outputs.0.filename")("RGBA_0.exr");
 		props<<luxrays::Property("film.outputs.0.index")("0");
@@ -2114,6 +2140,8 @@ bool Renderer::Initialize(Flags flags)
 	}
 	try
 	{
+		if(!m_lxConfig->HasCachedKernels())
+			std::cout<<"Compiling LuxCoreRender kernels... This may take a while!"<<std::endl;
 		m_lxSession->Start();
 	}
 	catch(const std::runtime_error &e)
@@ -2203,6 +2231,8 @@ void Renderer::SyncObject(const unirender::Object &obj)
 	// so we'll have to create multiple objects (one per shader/material)
 
 	auto &mesh = obj.GetMesh();
+	if(uvec::length_sqr(obj.GetScale()) < 0.001)
+		return; // Objects with a scale of 0 result in a LuxCore matrix exception: https://github.com/LuxCoreRender/LuxCore/blob/e54bcf3ffb7feac5964e023c19ca3e7c4b98f530/src/luxrays/core/geometry/matrix4x4.cpp#L137
 
 	// Shaders
 	auto &luxNodeManager = get_lux_node_manager();
@@ -2808,13 +2838,5 @@ void Renderer::PrepareCyclesSceneForRendering()
 {
 	unirender::Renderer::PrepareCyclesSceneForRendering();
 }
-
-// These *should* be exported by the OpenEXR library, but for some reason don't,
-// so we re-define them here
-#include "OpenEXR/half.h"
-const half::uif half::_toFloat[1 << 16] =
-    #include "OpenEXR/toFloat.h";
-const unsigned short half::_eLut[1 << 9] =
-    #include "OpenEXR/eLut.h";
 
 #pragma optimize("",on)
