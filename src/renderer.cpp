@@ -1330,6 +1330,9 @@ bool Renderer::Suspend()
 }
 void Renderer::UpdateProgressiveRender()
 {
+	auto renderMode = m_scene->GetRenderMode();
+	if(renderMode != unirender::Scene::RenderMode::RenderImage)
+		return;
 	constexpr auto useFloatFormat = true;
 	auto &scene = GetScene();
 	auto resolution = scene.GetResolution();
@@ -2041,6 +2044,7 @@ bool Renderer::Initialize(Flags flags)
 		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(Scene::RenderMode::SceneAlbedo)));
 		props<<luxrays::Property(propName +".filename")("albedo.exr");
 		props<<luxrays::Property(propName +".filesafe")("0");
+		props<<luxrays::Property(propName +".index")("0");
 	}
 	if(enableNormalOutput)
 	{
@@ -2049,6 +2053,7 @@ bool Renderer::Initialize(Flags flags)
 		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(Scene::RenderMode::SceneNormals)));
 		props<<luxrays::Property(propName +".filename")("normal.exr");
 		props<<luxrays::Property(propName +".filesafe")("0");
+		props<<luxrays::Property(propName +".index")("0");
 	}
 	if(
 		renderMode != unirender::Scene::RenderMode::RenderImage &&
@@ -2064,6 +2069,7 @@ bool Renderer::Initialize(Flags flags)
 		props<<luxrays::Property(propName +".type")(TranslateOutputTypeToLuxCoreRender(GetOutputType(renderMode)));
 		props<<luxrays::Property(propName +".filename")(TranslateOutputTypeToLuxCoreRender(GetOutputType(renderMode)) +".exr");
 		props<<luxrays::Property(propName +".filesafe")("0");
+		props<<luxrays::Property(propName +".index")("0");
 	}
 	if(ShouldUseTransparentSky())
 	{
@@ -2074,6 +2080,7 @@ bool Renderer::Initialize(Flags flags)
 		props<<luxrays::Property(propName +".type")(alphaOutput.second);
 		props<<luxrays::Property(propName +".filename")("alpha.exr");
 		props<<luxrays::Property(propName +".filesafe")("0");
+		props<<luxrays::Property(propName +".index")("0");
 	}
 	if(bakeLightmaps && m_bakeObjectNames.empty() == false)
 	{
