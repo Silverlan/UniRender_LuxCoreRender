@@ -1689,7 +1689,7 @@ bool Renderer::FinalizeLightmap(const std::string &inputPath,const std::string &
 	if(m_colorTransformProcessor) // TODO: Should we really apply color transform if we're not denoising?
 	{
 		std::string err;
-		if(m_colorTransformProcessor->Apply(*resultImageBuffer,err,0.f,m_scene->GetGamma()) == false)
+		if(m_colorTransformProcessor->Apply(*resultImageBuffer,err) == false)
 			m_scene->HandleError("Unable to apply color transform: " +err);
 	}
 	resultImageBuffer->Convert(uimg::Format::RGBA_HDR);
@@ -1875,7 +1875,7 @@ bool Renderer::Initialize(Flags flags)
 		ColorTransformProcessorCreateInfo ctpCreateInfo {};
 		ctpCreateInfo.config = createInfo.colorTransform->config;
 		ctpCreateInfo.lookName = createInfo.colorTransform->lookName;
-		m_colorTransformProcessor = create_color_transform_processor(ctpCreateInfo,err);
+		m_colorTransformProcessor = create_color_transform_processor(ctpCreateInfo,err,0.f,m_scene->GetGamma());
 		if(m_colorTransformProcessor == nullptr)
 			m_scene->HandleError("Unable to initialize color transform processor: " +err);
 	}
