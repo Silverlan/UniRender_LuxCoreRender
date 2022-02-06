@@ -1685,14 +1685,12 @@ bool Renderer::FinalizeLightmap(const std::string &inputPath,const std::string &
 	resultImageBuffer->ApplyExposure(GetScene().GetCreateInfo().exposure *exposureMul); // Factor is subjective to match Cycles behavior
 
 	// Denoise
-	DenoiseInfo denoiseInfo {};
-	denoiseInfo.hdr = true;
+	denoise::Info denoiseInfo {};
 	denoiseInfo.width = resultImageBuffer->GetWidth();
 	denoiseInfo.height = resultImageBuffer->GetHeight();
 	denoiseInfo.lightmap = true;
 
-	resultImageBuffer->Convert(uimg::Format::RGB_FLOAT);
-	denoise(denoiseInfo,*resultImageBuffer,nullptr,nullptr,[this](float progress) -> bool {
+	denoise::denoise(denoiseInfo,*resultImageBuffer,nullptr,nullptr,[this](float progress) -> bool {
 		return true;
 	});
 
