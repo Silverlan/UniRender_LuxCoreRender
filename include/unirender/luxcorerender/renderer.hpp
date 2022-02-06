@@ -98,8 +98,9 @@ namespace unirender::luxcorerender
 		virtual bool Pause() override;
 		virtual bool Resume() override;
 		virtual bool Suspend() override;
-		virtual bool BeginSceneEdit() const override;
-		virtual bool EndSceneEdit() const override;
+		virtual bool BeginSceneEdit() override;
+		virtual bool EndSceneEdit() override;
+		virtual bool SyncEditedActor(const util::Uuid &uuid) override;
 		virtual bool Export(const std::string &path) override;
 		virtual std::optional<std::string> SaveRenderPreview(const std::string &path,std::string &outErr) const override;
 		virtual util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> StartRender() override;

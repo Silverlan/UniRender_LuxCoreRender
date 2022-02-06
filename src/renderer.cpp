@@ -1376,19 +1376,29 @@ void Renderer::UpdateProgressiveRender()
 	const_cast<Renderer*>(this)->m_tileManager.ApplyPostProcessingForProgressiveTile(tileData);
 	const_cast<Renderer*>(this)->m_tileManager.AddRenderedTile(std::move(tileData));
 }
-bool Renderer::BeginSceneEdit() const
+bool Renderer::BeginSceneEdit()
 {
 	if(!umath::is_flag_set(m_flags,Flags::EnableLiveEditing))
 		return false;
 	m_lxSession->BeginSceneEdit();
 	return true;
 }
-bool Renderer::EndSceneEdit() const
+bool Renderer::EndSceneEdit()
 {
 	if(!umath::is_flag_set(m_flags,Flags::EnableLiveEditing))
 		return false;
-	const_cast<Renderer*>(this)->SyncCamera(m_scene->GetCamera());
 	m_lxSession->EndSceneEdit();
+	return true;
+}
+bool Renderer::SyncEditedActor(const util::Uuid &uuid)
+{
+	auto *actor = FindActor(uuid);
+	if(!actor)
+		return false;
+	if(typeid(*actor) == typeid(Camera))
+		SyncCamera(m_scene->GetCamera());
+	else
+		return false;
 	return true;
 }
 bool Renderer::Export(const std::string &strPath)
@@ -1850,6 +1860,7 @@ bool Renderer::Initialize(Flags flags)
 		for(auto &o : chunk.GetObjects())
 			SyncObject(*o);
 	}
+	UpdateActorMap();
 
 	auto &defWorldVolume = GetDefaultWorldVolume();
 	if(!defWorldVolume.empty())
