@@ -1884,6 +1884,7 @@ bool Renderer::Initialize(Flags flags)
 		ColorTransformProcessorCreateInfo ctpCreateInfo {};
 		ctpCreateInfo.config = createInfo.colorTransform->config;
 		ctpCreateInfo.lookName = createInfo.colorTransform->lookName;
+		ctpCreateInfo.bitDepth = ColorTransformProcessorCreateInfo::BitDepth::Float32;
 		m_colorTransformProcessor = create_color_transform_processor(ctpCreateInfo,err,0.f,m_scene->GetGamma());
 		if(m_colorTransformProcessor == nullptr)
 			m_scene->HandleError("Unable to initialize color transform processor: " +err);
