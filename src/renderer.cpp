@@ -1024,7 +1024,7 @@ float Renderer::ToLuxLength(float len)
 
 std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene,Flags flags)
 {
-	auto renderer = std::shared_ptr<Renderer>{new Renderer{scene}};
+	auto renderer = std::shared_ptr<Renderer>{new Renderer{scene,flags}};
 	if(renderer->Initialize(flags) == false)
 		return nullptr;
 	return renderer;
@@ -2186,8 +2186,8 @@ bool Renderer::Initialize(Flags flags)
 	return true;
 }
 
-Renderer::Renderer(const Scene &scene)
-	: unirender::Renderer{scene}
+Renderer::Renderer(const Scene &scene,Flags flags)
+	: unirender::Renderer{scene,flags}
 {}
 
 void Renderer::SyncCamera(const unirender::Camera &cam)

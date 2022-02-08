@@ -105,7 +105,7 @@ namespace unirender::luxcorerender
 		virtual std::optional<std::string> SaveRenderPreview(const std::string &path,std::string &outErr) const override;
 		virtual util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> StartRender() override;
 	private:
-		Renderer(const Scene &scene);
+		Renderer(const Scene &scene,Flags flags);
 		void StopRenderSession();
 		void UpdateProgressiveRender();
 		static std::string GetName(const BaseObject &obj);
