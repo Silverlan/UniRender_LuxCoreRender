@@ -29,6 +29,7 @@
 #include <sharedutils/util_path.hpp>
 #include <sharedutils/scope_guard.h>
 #include <fsys/filesystem.h>
+#include <fsys/ifile.hpp>
 #define TINYEXR_IMPLEMENTATION
 #include "tinyexr.h"
 
@@ -1426,6 +1427,9 @@ void Renderer::FinalizeImage(uimg::ImageBuffer &imgBuf,StereoEye eyeStage)
 	}
 
 	imgBuf.FlipVertically();
+
+	if(ShouldDumpRenderStageImages())
+		DumpImage("luxcore",imgBuf,uimg::ImageFormat::HDR);
 }
 util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye eyeStage,unirender::Renderer::RenderStageResult *optResult)
 {
@@ -1486,7 +1490,7 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 
 				LC_LOG(buf);
 			}
-			
+
 			auto &resultImageBuffer = GetResultImageBuffer(OUTPUT_COLOR,eyeStage);
 			auto renderMode = m_scene->GetRenderMode();
 			auto width = film.GetWidth();
@@ -1585,14 +1589,24 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker,unirender::Ren
 					{
 						// film.AsyncExecuteImagePipeline(0);
 						film.GetOutput<float>(luxcore::Film::FilmOutputType::OUTPUT_RGBA,static_cast<float*>(resultImageBuffer->GetData()));
+						
+						auto apiData = GetApiData();
+						std::string rawOutputFileName;
+						if(apiData.GetFromPath("luxCoreRender/debug/rawOutputFileName")(rawOutputFileName))
+							DumpImage("raw",*resultImageBuffer,uimg::ImageFormat::HDR,rawOutputFileName);
+
+						if(ShouldDumpRenderStageImages())
+							DumpImage("raw",*resultImageBuffer,uimg::ImageFormat::HDR);
 					}
 					catch(const std::exception &e)
 					{
-						std::cout<<"EX: "<<e.what()<<std::endl;
+						std::cout<<"Failed to retrieve RGBA film output: "<<e.what()<<std::endl;
 					}
 				}
 				float exposureMul = 0.02f;
 				resultImageBuffer->ApplyExposure(GetScene().GetCreateInfo().exposure *exposureMul); // Factor is subjective to match Cycles behavior
+				if(ShouldDumpRenderStageImages())
+					DumpImage("exposure",*resultImageBuffer,uimg::ImageFormat::HDR);
 				/*auto exposure = GetScene().GetCreateInfo().exposure;
 				for(auto &pxView : *resultImageBuffer)
 				{
@@ -2456,8 +2470,11 @@ void Renderer::SyncLight(const unirender::Light &light)
 		props<<luxrays::Property(propName +".type")("spot");
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
 		props<<luxrays::Property(propName +".target")(target.x,target.y,target.z);
-		props<<luxrays::Property(propName +".coneangle")(light.GetOuterConeAngle());
-		props<<luxrays::Property(propName +".conedeltaangle")(light.GetOuterConeAngle() -light.GetInnerConeAngle());
+		auto outerConeAngle = light.GetOuterConeAngle();
+		auto blend = light.GetBlendFraction();
+		auto innerConeAngle = outerConeAngle *(1.f -blend);
+		props<<luxrays::Property(propName +".coneangle")(outerConeAngle);
+		props<<luxrays::Property(propName +".conedeltaangle")(light.GetOuterConeAngle() -innerConeAngle);
 		break;
 	}
 	case unirender::Light::Type::Point:
@@ -2476,8 +2493,6 @@ void Renderer::SyncLight(const unirender::Light &light)
 		auto pos = ToLuxPosition(light.GetPose().GetOrigin());
 		auto dir = ToLuxNormal(uquat::forward(light.GetPose().GetRotation()));
 		auto target = pos +to_luxcore_vector(dir) *100.f;
-		auto outerConeAngle = light.GetOuterConeAngle();
-		auto innerConeAngle = umath::min(light.GetInnerConeAngle(),outerConeAngle);
 		props<<luxrays::Property(propName +".type")("sun");
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
 		props<<luxrays::Property(propName +".dir")(dir.x,dir.y,dir.z);
