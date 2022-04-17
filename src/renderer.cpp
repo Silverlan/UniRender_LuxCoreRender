@@ -2454,6 +2454,11 @@ void Renderer::SyncLight(const unirender::Light &light)
 		gain *= gainMul;
 	}
 
+	auto apiData = GetApiData();
+	auto customLightIntensityMultiplier = 1.f;
+	if(apiData.GetFromPath("lightIntensityMultiplier")(customLightIntensityMultiplier))
+		gain = customLightIntensityMultiplier;
+
 	luxrays::Properties props {};
 	props<<luxrays::Property{propName +".color"}(color.r,color.g,color.b);
 	props<<luxrays::Property{propName +".gain"}(gain,gain,gain);
