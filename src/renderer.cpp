@@ -2475,11 +2475,13 @@ void Renderer::SyncLight(const unirender::Light &light)
 		props<<luxrays::Property(propName +".type")("spot");
 		props<<luxrays::Property(propName +".position")(pos.x,pos.y,pos.z);
 		props<<luxrays::Property(propName +".target")(target.x,target.y,target.z);
-		auto outerConeAngle = light.GetOuterConeAngle();
-		auto blend = light.GetBlendFraction();
+		auto outerConeAngle = umath::clamp(light.GetOuterConeAngle(),0.f,180.f);
+		auto blend = umath::clamp(light.GetBlendFraction(),0.f,1.f);
 		auto innerConeAngle = outerConeAngle *(1.f -blend);
+		outerConeAngle /= 2.f;
+		innerConeAngle /= 2.f;
 		props<<luxrays::Property(propName +".coneangle")(outerConeAngle);
-		props<<luxrays::Property(propName +".conedeltaangle")(light.GetOuterConeAngle() -innerConeAngle);
+		props<<luxrays::Property(propName +".conedeltaangle")(outerConeAngle -innerConeAngle);
 		break;
 	}
 	case unirender::Light::Type::Point:
