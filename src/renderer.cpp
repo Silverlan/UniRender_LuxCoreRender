@@ -2656,9 +2656,9 @@ void Renderer::SyncMesh(const unirender::Mesh &mesh)
 			virtual uint32_t GetTriangleCount() const override {return getTriangleCount();}
 			virtual uint32_t GetVertexCount() const override {return getVertexCount();}
 			virtual std::array<uint32_t,3> GetTriangle(uint32_t triIdx) const override {return getTriangle(triIdx);}
-			virtual const Vector3 &GetVertexPosition(uint32_t vertIdx) const override {return getVertexPosition(vertIdx);}
-			virtual const Vector3 &GetVertexNormal(uint32_t vertIdx) const override {return getVertexNormal(vertIdx);}
-			virtual const Vector2 &GetVertexUv(uint32_t vertIdx) const override {return getVertexUv(vertIdx);}
+			virtual const Vector3 GetVertexPosition(uint32_t vertIdx) const override {return getVertexPosition(vertIdx);}
+			virtual const Vector3 GetVertexNormal(uint32_t vertIdx) const override {return getVertexNormal(vertIdx);}
+			virtual const Vector2 GetVertexUv(uint32_t vertIdx) const override {return getVertexUv(vertIdx);}
 
 			std::function<uint32_t()> getTriangleCount = nullptr;
 			std::function<uint32_t()> getVertexCount = nullptr;
