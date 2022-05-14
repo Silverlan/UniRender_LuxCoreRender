@@ -33,6 +33,13 @@
 #define TINYEXR_IMPLEMENTATION
 #include "tinyexr.h"
 
+// Temporary workaround for bug introduced in Visual Studio 17.2+
+// See https://developercommunity.visualstudio.com/t/-imp-std-init-once-complete-unresolved-external-sy/1684365
+#if _MSC_VER >= 1932 // Visual Studio 2022 version 17.2+
+#    pragma comment(linker, "/alternatename:__imp___std_init_once_complete=__imp_InitOnceComplete")
+#    pragma comment(linker, "/alternatename:__imp___std_init_once_begin_initialize=__imp_InitOnceBeginInitialize")
+#endif
+
 using namespace unirender::luxcorerender;
 #pragma optimize("",off)
 #include <sharedutils/util_hair.hpp>
