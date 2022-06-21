@@ -103,7 +103,7 @@ namespace unirender::luxcorerender
 		virtual bool SyncEditedActor(const util::Uuid &uuid) override;
 		virtual bool Export(const std::string &path) override;
 		virtual std::optional<std::string> SaveRenderPreview(const std::string &path,std::string &outErr) const override;
-		virtual util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> StartRender() override;
+		virtual util::ParallelJob<uimg::ImageLayerSet> StartRender() override;
 	private:
 		Renderer(const Scene &scene,Flags flags);
 		void StopRenderSession();

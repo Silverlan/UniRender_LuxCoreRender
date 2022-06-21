@@ -1772,7 +1772,7 @@ void Renderer::CloseRenderScene()
 	}*/
 	StopRenderSession();
 }
-util::ParallelJob<std::shared_ptr<uimg::ImageBuffer>> Renderer::StartRender()
+util::ParallelJob<uimg::ImageLayerSet> Renderer::StartRender()
 {
 	auto job = util::create_parallel_job<RenderWorker>(*this);
 	auto &worker = static_cast<RenderWorker&>(job.GetWorker());
