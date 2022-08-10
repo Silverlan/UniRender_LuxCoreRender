@@ -101,6 +101,7 @@ namespace unirender::luxcorerender
 		virtual bool BeginSceneEdit() override;
 		virtual bool EndSceneEdit() override;
 		virtual bool SyncEditedActor(const util::Uuid &uuid) override;
+		virtual bool AddLiveActor(unirender::WorldObject &actor) override;
 		virtual bool Export(const std::string &path) override;
 		virtual std::optional<std::string> SaveRenderPreview(const std::string &path,std::string &outErr) const override;
 		virtual util::ParallelJob<uimg::ImageLayerSet> StartRender() override;

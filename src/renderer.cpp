@@ -1409,6 +1409,10 @@ bool Renderer::SyncEditedActor(const util::Uuid &uuid)
 		return false;
 	return true;
 }
+bool Renderer::AddLiveActor(unirender::WorldObject &actor)
+{
+	return false;
+}
 bool Renderer::Export(const std::string &strPath)
 {
 	FileManager::CreatePath(strPath.c_str());
