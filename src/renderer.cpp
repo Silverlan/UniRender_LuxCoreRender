@@ -951,10 +951,15 @@ void LuxNodeManager::Initialize()
 
 ////////////
 
+#ifdef __linux__
+#define DLLEXPORT __attribute__((visibility("default")))
+#else
+#define DLLEXPORT __declspec(dllexport)
+#endif
 extern "C" {
-	bool __declspec(dllexport) create_renderer(const unirender::Scene &scene,unirender::Renderer::Flags flags,std::shared_ptr<unirender::Renderer> &outRenderer)
+	bool DLLEXPORT create_renderer(const unirender::Scene &scene,unirender::Renderer::Flags flags,std::shared_ptr<unirender::Renderer> &outRenderer,std::string &outErr)
 	{
-		outRenderer = Renderer::Create(scene,flags);
+		outRenderer = Renderer::Create(scene,outErr,flags);
 		return outRenderer != nullptr;
 	}
 };
@@ -1030,10 +1035,10 @@ float Renderer::ToLuxLength(float len)
 #endif
 }
 
-std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene,Flags flags)
+std::shared_ptr<Renderer> Renderer::Create(const unirender::Scene &scene,std::string &outErr,Flags flags)
 {
 	auto renderer = std::shared_ptr<Renderer>{new Renderer{scene,flags}};
-	if(renderer->Initialize(flags) == false)
+	if(renderer->Initialize(flags,outErr) == false)
 		return nullptr;
 	return renderer;
 }
@@ -1784,7 +1789,7 @@ util::ParallelJob<uimg::ImageLayerSet> Renderer::StartRender()
 	return job;
 }
 
-bool Renderer::Initialize(Flags flags)
+bool Renderer::Initialize(Flags flags,std::string &outErr)
 {
 	PrepareCyclesSceneForRendering();
 
@@ -1804,7 +1809,10 @@ bool Renderer::Initialize(Flags flags)
 		luxcore::SetLogHandler();
 	std::unique_ptr<luxcore::Scene> lcScene{luxcore::Scene::Create()};
 	if(lcScene == nullptr)
+	{
+		outErr = "Failed to create luxcorerender scene!";
 		return false;
+	}
 	try
 	{
 		auto &sceneInfo = m_scene->GetSceneInfo();
@@ -2170,7 +2178,10 @@ bool Renderer::Initialize(Flags flags)
 	)};
 	std::unique_ptr<luxcore::RenderSession> lcSession {luxcore::RenderSession::Create(lcConfig.get())};
 	if(lcSession == nullptr)
+	{
+		outErr = "Failed to create luxcorerender session!";
 		return false;
+	}
 	m_lxConfig = std::move(lcConfig);
 	m_lxSession = std::move(lcSession);
 
@@ -2189,6 +2200,7 @@ bool Renderer::Initialize(Flags flags)
 	catch(const std::runtime_error &e)
 	{
 		std::cout<<"Unable to start LuxCoreRender session: "<<e.what()<<std::endl;
+		outErr = "Failed to start luxcorerender session: " +std::string{e.what()} +"!";
 		return false;
 	}
 
@@ -2206,6 +2218,7 @@ bool Renderer::Initialize(Flags flags)
 	catch(const std::exception &e)
 	{
 		std::cout<<"Ex: "<<e.what()<<std::endl;
+		outErr = "Failed to create luxcorerender renderer: " +std::string{e.what()} +"!";
 		return false;
 	}
 	return true;

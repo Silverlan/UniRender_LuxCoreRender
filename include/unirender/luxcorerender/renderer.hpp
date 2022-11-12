@@ -40,7 +40,7 @@ namespace unirender::luxcorerender
 			Bake // For internal use only!
 		};
 
-		static std::shared_ptr<Renderer> Create(const unirender::Scene &scene,Flags flags);
+		static std::shared_ptr<Renderer> Create(const unirender::Scene &scene,std::string &outErr,Flags flags);
 		static std::shared_ptr<Renderer> CreateResume();
 		static std::string TranslateOutputTypeToLuxCoreRender(const std::string &type);
 		static constexpr uint32_t LIGHTMAP_UV_CHANNEL = 1;
@@ -121,7 +121,7 @@ namespace unirender::luxcorerender
 		virtual void CloseRenderScene() override;
 		virtual void FinalizeImage(uimg::ImageBuffer &imgBuf,StereoEye eyeStage);
 		
-		bool Initialize(Flags flags);
+		bool Initialize(Flags flags,std::string &outErr);
 		void SyncCamera(const unirender::Camera &cam);
 		void SyncFilm(const unirender::Camera &cam);
 		void SyncObject(const unirender::Object &obj);
