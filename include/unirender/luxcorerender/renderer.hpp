@@ -22,16 +22,18 @@
 #include <cinttypes>
 #include <atomic>
 
-namespace unirender {class Scene;};
-namespace luxcore {class Scene; class RenderConfig; class RenderSession;};
-namespace unirender::luxcorerender
-{
-	class DLLRTUTIL Renderer
-		: public unirender::Renderer
-	{
-	public:
-		enum class RenderEngine : uint32_t
-		{
+namespace unirender {
+	class Scene;
+};
+namespace luxcore {
+	class Scene;
+	class RenderConfig;
+	class RenderSession;
+};
+namespace unirender::luxcorerender {
+	class DLLRTUTIL Renderer : public unirender::Renderer {
+	  public:
+		enum class RenderEngine : uint32_t {
 			PathTracer = 0,
 			TiledPathTracer,
 			BidirectionalPathTracer,
@@ -40,9 +42,9 @@ namespace unirender::luxcorerender
 			Bake // For internal use only!
 		};
 
-		static std::shared_ptr<Renderer> Create(const unirender::Scene &scene,std::string &outErr,Flags flags);
+		static std::shared_ptr<Renderer> Create(const unirender::Scene &scene, std::string &outErr, Flags flags);
 		static std::shared_ptr<Renderer> CreateResume();
-		static std::string TranslateOutputTypeToLuxCoreRender(const std::string &type);
+		static std::optional<std::string> TranslateOutputTypeToLuxCoreRender(unirender::PassType type);
 		static constexpr uint32_t LIGHTMAP_UV_CHANNEL = 1;
 		static constexpr const char *LIGHTMAP_ATLAS_OUTPUT_FILENAME = "temp/lightmap_atlas.exr";
 		static constexpr const char *OUTPUT_ALPHA = "ALPHA";
@@ -68,7 +70,7 @@ namespace unirender::luxcorerender
 		static constexpr const char *OUTPUT_IRRADIANCE = "OUTPUT_IRRADIANCE";
 		static constexpr const char *OUTPUT_NOISE = "OUTPUT_NOISE";
 		static constexpr const char *OUTPUT_CAUSTIC = "OUTPUT_CAUSTIC";
-		static std::string GetOutputType(Scene::RenderMode renderMode);
+		static std::optional<unirender::PassType> GetPassType(Scene::RenderMode renderMode);
 		static luxcore::Film::FilmOutputType GetLuxCoreFilmOutputType(Scene::RenderMode renderMode);
 		static uimg::Format GetOutputFormat(Scene::RenderMode renderMode);
 
@@ -77,16 +79,16 @@ namespace unirender::luxcorerender
 		static luxrays::Point ToLuxPosition(const Vector3 &pos);
 		static luxrays::Normal ToLuxNormal(const Vector3 &n);
 		static luxrays::UV ToLuxUV(const Vector2 &uv);
-		static umath::ScaledTransform ToLuxTransform(const umath::ScaledTransform &t,bool applyRotOffset=false);
+		static umath::ScaledTransform ToLuxTransform(const umath::ScaledTransform &t, bool applyRotOffset = false);
 		static float ToLuxLength(float len);
 
-		luxcore::Scene &GetLuxScene() {return *m_lxScene;}
-		bool ShouldUsePhotonGiCache() const {return m_enablePhotonGiCache;}
-		bool ShouldUseHairShader() const {return m_useHairShader;}
-		const std::string &GetCurrentShaderName() const {return m_curShaderName;}
+		luxcore::Scene &GetLuxScene() { return *m_lxScene; }
+		bool ShouldUsePhotonGiCache() const { return m_enablePhotonGiCache; }
+		bool ShouldUseHairShader() const { return m_useHairShader; }
+		const std::string &GetCurrentShaderName() const { return m_curShaderName; }
 
-		const std::string &GetDefaultWorldVolume() const {return m_defaultWorldVolume;}
-		void SetDefaultWorldVolume(const std::string &vol) {m_defaultWorldVolume = vol;}
+		const std::string &GetDefaultWorldVolume() const { return m_defaultWorldVolume; }
+		void SetDefaultWorldVolume(const std::string &vol) { m_defaultWorldVolume = vol; }
 
 		virtual ~Renderer() override;
 		virtual void Wait() override;
@@ -103,36 +105,36 @@ namespace unirender::luxcorerender
 		virtual bool SyncEditedActor(const util::Uuid &uuid) override;
 		virtual bool AddLiveActor(unirender::WorldObject &actor) override;
 		virtual bool Export(const std::string &path) override;
-		virtual std::optional<std::string> SaveRenderPreview(const std::string &path,std::string &outErr) const override;
+		virtual std::optional<std::string> SaveRenderPreview(const std::string &path, std::string &outErr) const override;
 		virtual util::ParallelJob<uimg::ImageLayerSet> StartRender() override;
-	private:
-		Renderer(const Scene &scene,Flags flags);
+	  private:
+		Renderer(const Scene &scene, Flags flags);
 		void StopRenderSession();
 		void UpdateProgressiveRender();
 		static std::string GetName(const BaseObject &obj);
-		static std::string GetName(const Object &obj,uint32_t shaderIdx);
-		static std::string GetName(const Mesh &mesh,uint32_t shaderIdx);
+		static std::string GetName(const Object &obj, uint32_t shaderIdx);
+		static std::string GetName(const Mesh &mesh, uint32_t shaderIdx);
 
 		// For testing/debugging purposes only!
-		bool FinalizeLightmap(const std::string &inputPath,const std::string &outputPath);
+		bool FinalizeLightmap(const std::string &inputPath, const std::string &outputPath);
 
-		virtual util::EventReply HandleRenderStage(RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye eyeStage,unirender::Renderer::RenderStageResult *optResult=nullptr) override;
-		virtual bool UpdateStereoEye(unirender::RenderWorker &worker,unirender::Renderer::ImageRenderStage stage,StereoEye &eyeStage) override;
+		virtual util::EventReply HandleRenderStage(RenderWorker &worker, unirender::Renderer::ImageRenderStage stage, StereoEye eyeStage, unirender::Renderer::RenderStageResult *optResult = nullptr) override;
+		virtual bool UpdateStereoEye(unirender::RenderWorker &worker, unirender::Renderer::ImageRenderStage stage, StereoEye &eyeStage) override;
 		virtual void CloseRenderScene() override;
-		virtual void FinalizeImage(uimg::ImageBuffer &imgBuf,StereoEye eyeStage);
-		
-		bool Initialize(Flags flags,std::string &outErr);
+		virtual void FinalizeImage(uimg::ImageBuffer &imgBuf, StereoEye eyeStage);
+
+		bool Initialize(Flags flags, std::string &outErr);
 		void SyncCamera(const unirender::Camera &cam);
 		void SyncFilm(const unirender::Camera &cam);
 		void SyncObject(const unirender::Object &obj);
 		void SyncMesh(const unirender::Mesh &mesh);
 		void SyncLight(const unirender::Light &light);
-		virtual void SetCancelled(const std::string &msg="Cancelled by application.") override;
+		virtual void SetCancelled(const std::string &msg = "Cancelled by application.") override;
 		virtual void PrepareCyclesSceneForRendering() override;
 
 		Flags m_flags = Flags::None;
 		std::vector<std::string> m_bakeObjectNames {};
-		std::unordered_set<const unirender::Mesh*> m_lightmapMeshes {};
+		std::unordered_set<const unirender::Mesh *> m_lightmapMeshes {};
 		unirender::Object *m_bakeTarget = nullptr;
 		std::vector<std::string> m_objectShaders;
 		uint32_t m_shaderNodeIdx = 0;
@@ -144,7 +146,7 @@ namespace unirender::luxcorerender
 		std::unique_ptr<luxcore::RenderConfig> m_lxConfig = nullptr;
 		std::unique_ptr<luxcore::RenderSession> m_lxSession = nullptr;
 		bool m_useHairShader = false;
-		
+
 		RenderEngine m_renderEngine = RenderEngine::PathTracer;
 		bool m_enablePhotonGiCache = false;
 		bool m_enableLightSamplingCache = false;
