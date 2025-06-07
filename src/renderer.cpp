@@ -1292,7 +1292,7 @@ bool Renderer::Resume()
 bool Renderer::Suspend()
 {
 	Pause();
-	auto path = util::Path::CreatePath(util::get_program_path()) + "frame.rsm";
+	auto path = util::Path::CreatePath(util::get_program_write_path()) + "frame.rsm";
 	m_lxSession->SaveResumeFile(path.GetString());
 	return true;
 }
@@ -1370,13 +1370,13 @@ bool Renderer::AddLiveActor(unirender::WorldObject &actor) { return false; }
 bool Renderer::Export(const std::string &strPath)
 {
 	FileManager::CreatePath(strPath.c_str());
-	auto path = util::Path::CreatePath(util::get_program_path()) + strPath;
+	auto path = util::Path::CreatePath(util::get_program_write_path()) + strPath;
 	m_lxConfig->Export(path.GetString());
 	return true;
 }
 std::optional<std::string> Renderer::SaveRenderPreview(const std::string &relPath, std::string &outErr) const
 {
-	auto path = util::Path::CreatePath(util::get_program_path()) + relPath;
+	auto path = util::Path::CreatePath(util::get_program_write_path()) + relPath;
 	std::string fileName = "render_preview.exr";
 	auto &film = m_lxSession->GetFilm();
 	film.SaveOutput((path + fileName).GetString(), luxcore::Film::FilmOutputType::OUTPUT_RGBA, {});
@@ -1526,7 +1526,7 @@ util::EventReply Renderer::HandleRenderStage(RenderWorker &worker, unirender::Re
 							float *rgba;
 							int w, h;
 							const char *err;
-							auto path = util::Path::CreatePath(util::get_program_path()) + LIGHTMAP_ATLAS_OUTPUT_FILENAME;
+							auto path = util::Path::CreatePath(util::get_program_write_path()) + LIGHTMAP_ATLAS_OUTPUT_FILENAME;
 							auto result = LoadEXR(&rgba, &w, &h, path.GetString().c_str(), &err);
 							// FileManager::RemoveFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME);
 							if(result != TINYEXR_SUCCESS) {
@@ -1633,7 +1633,7 @@ bool Renderer::FinalizeLightmap(const std::string &inputPath, const std::string 
 	float *rgba;
 	int w, h;
 	const char *err;
-	auto path = util::Path::CreatePath(util::get_program_path()) + inputPath;
+	auto path = util::Path::CreatePath(util::get_program_write_path()) + inputPath;
 	auto result = LoadEXR(&rgba, &w, &h, path.GetString().c_str(), &err);
 	// FileManager::RemoveFile(LIGHTMAP_ATLAS_OUTPUT_FILENAME);
 	if(result != TINYEXR_SUCCESS)
